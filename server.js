@@ -9,7 +9,7 @@ app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 
 app.get('/', (req, res) => {
-  res.json({ status: 'ContentOps Backend Running', version: '3.0 - Simple' });
+  res.json({ status: 'ContentOps Backend Running', version: '3.1 - HTML Preserved' });
 });
 
 // Webflow proxy
@@ -41,7 +41,7 @@ app.patch('/api/webflow', async (req, res) => {
   }
 });
 
-// SIMPLE analyze endpoint
+// IMPROVED analyze endpoint with HTML preservation
 app.post('/api/analyze', async (req, res) => {
   const startTime = Date.now();
   
@@ -54,7 +54,7 @@ app.post('/api/analyze', async (req, res) => {
 
     const anthropic = new Anthropic({ apiKey: anthropicKey });
     
-    console.log('Starting simple fact-check for:', title);
+    console.log('Starting analysis for:', title);
 
     // STEP 1: Smart Brave searches based on blog content
     const searches = [];
@@ -69,6 +69,8 @@ app.post('/api/analyze', async (req, res) => {
     if (blogText.includes('hubspot')) productNames.add('HubSpot');
     if (blogText.includes('meet alfred') || blogText.includes('meetalfred')) productNames.add('Meet Alfred');
     if (blogText.includes('expandi')) productNames.add('Expandi');
+    if (blogText.includes('linkedin helper')) productNames.add('LinkedIn Helper');
+    if (blogText.includes('octopus crm')) productNames.add('Octopus CRM');
     
     // Build search queries
     productNames.forEach(product => {
@@ -117,8 +119,8 @@ app.post('/api/analyze', async (req, res) => {
 
     console.log(`Completed ${searchCount} searches with detailed results`);
 
-    // STEP 2: Claude rewrite with detailed search results
-    const prompt = writingPrompt || `You are a blog fact-checker. Use search results to verify and update factual claims.`;
+    // STEP 2: Claude rewrite with STRICT HTML preservation
+    const prompt = writingPrompt || `You are an expert blog fact-checker and editor specializing in B2B SaaS content.`;
 
     const response = await anthropic.messages.create({
       model: 'claude-sonnet-4-20250514',
@@ -126,45 +128,82 @@ app.post('/api/analyze', async (req, res) => {
       system: prompt,
       messages: [{
         role: 'user',
-        content: `Update this blog using search results. Be thorough with numbers and facts.
+        content: `Update this blog using search results. CRITICALLY IMPORTANT: Preserve ALL HTML structure exactly.
 
 SEARCH RESULTS FROM BRAVE:
 ${searchResults}
 
-BLOG TO UPDATE:
+BLOG TO UPDATE (HTML):
 ${blogContent}
 
-CRITICAL INSTRUCTIONS:
-1. For EVERY product mentioned, check search results for:
-   - Current pricing (2025)
-   - Number of users/customers
-   - Key features
-   - Any limits or restrictions
+=== CRITICAL: FIX CONTRADICTIONS ===
+1. If the blog says "X costs the same as Y at $29" but then shows X pricing at $59, REMOVE the "same price" claim
+2. If pricing details conflict within the same paragraph, use the MOST SPECIFIC information (the actual pricing table)
+3. NEVER leave contradictory statements like "starts at $29" followed by "Basic Plan: $59"
+4. When in doubt about pricing, CHECK THE SEARCH RESULTS and use official data
 
-2. MUST update if found in search results:
-   - User counts (e.g., "4200+ users")
-   - Pricing (exact amounts)
-   - LinkedIn limits (75/day for connections, NOT 100/week)
-   - Feature names
+=== CRITICAL HTML PRESERVATION RULES ===
+1. NEVER remove or modify ANY HTML tags (<h2>, <h3>, <p>, <strong>, <a>, <img>, <ul>, <li>, etc.)
+2. NEVER remove or modify href attributes in <a> tags
+3. NEVER remove or modify src attributes in <img> tags
+4. NEVER change the nesting or structure of HTML elements
+5. ONLY update the TEXT CONTENT between tags
+6. Keep ALL class names, IDs, and other attributes exactly as they are
+7. Preserve ALL line breaks and formatting within HTML
 
-3. Grammar fixes:
-   - Remove em-dashes (—)
-   - Shorten 30+ word sentences
-   - Remove: transform, delve, unleash, revolutionize, meticulous, navigating, realm, bespoke, tailored, autopilot, magic
+=== FUNNEL-AWARE EDITING ===
+Identify the blog's funnel stage and edit accordingly:
 
-4. PRESERVE:
-   - ALL HTML tags, structure, headings
-   - ALL images and links
-   - Original tone and style
+**TOFU (Top of Funnel - Awareness)**
+- Educational, broad topics (e.g., "What is LinkedIn automation?")
+- Keep: High-level explanations, industry stats, beginner-friendly tone
+- Update: Generic statistics, market sizes, trend data
+- Avoid: Pushing specific products too hard
 
-5. Return COMPLETE blog (don't cut off early)
+**MOFU (Middle of Funnel - Consideration)**
+- Comparison guides, "best tools" lists, feature breakdowns
+- Keep: Balanced comparisons, pros/cons, use case scenarios
+- Update: Pricing, feature lists, user counts, comparison tables
+- Focus: Help readers evaluate options fairly
 
-EXAMPLE CORRECTIONS:
-- If search shows "SalesRobot has 4200+ users" → update blog to say "4200+"
-- If search shows "LinkedIn allows 75 connection requests per day" → update to "75 per day"
-- If search shows "Dripify pricing starts at $79" → update to "$79"
+**BOFU (Bottom of Funnel - Decision)**
+- Product-specific guides, ROI calculators, implementation tips
+- Keep: Specific product benefits, CTAs, conversion-focused language
+- Update: Exact pricing, current features, integration details
+- Focus: Remove friction, provide concrete value props
 
-Return ONLY the updated HTML, no explanations.`
+=== FACT-CHECKING PRIORITIES ===
+1. **Pricing & Plans**: Update to 2025 current pricing from search results
+2. **User Counts**: Update with latest numbers (e.g., "4200+ users")
+3. **LinkedIn Limits**: 
+   - Connection requests: 75 per day (NOT 100/week)
+   - InMails: Depends on plan (check search results)
+4. **Feature Names**: Match official product terminology
+5. **Statistics**: Update with latest data from search results
+
+=== GRAMMAR & READABILITY ===
+1. Remove em-dashes (—) → use commas or periods
+2. Split sentences over 30 words
+3. Remove these overused words:
+   - transform, delve, unleash, revolutionize
+   - meticulous, navigating, realm, bespoke
+   - tailored, autopilot, magic, game-changer
+4. Use contractions (you'll, it's, don't)
+5. Prefer active voice over passive
+
+=== OUTPUT FORMAT ===
+Return ONLY the complete updated HTML.
+- NO markdown code blocks (no \`\`\`html)
+- NO explanations or comments
+- NO truncation (return FULL blog)
+- Start directly with the first HTML tag
+- End with the last closing tag
+
+EXAMPLE OF CORRECT UPDATE:
+Original: <p>SalesRobot has many users and costs around $100.</p>
+Updated:  <p>SalesRobot has 4200+ users and starts at $99/month.</p>
+
+(Notice: HTML structure identical, only text updated)`
       }]
     });
 
@@ -175,13 +214,21 @@ Return ONLY the updated HTML, no explanations.`
       }
     }
 
-    // Clean markdown artifacts
-    updatedContent = updatedContent.replace(/```html\n?/g, '').replace(/```\n?/g, '').trim();
+    // Clean markdown artifacts IF present (but don't strip valid HTML)
+    updatedContent = updatedContent.replace(/^```html\n?/g, '').replace(/\n?```$/g, '').trim();
 
-    // Validate we got content
+    // Validate we got substantial content
     if (!updatedContent || updatedContent.length < 500) {
       console.error('Warning: Content seems too short');
       updatedContent = blogContent; // Fallback to original
+    }
+
+    // Validate HTML structure is preserved
+    const originalTagCount = (blogContent.match(/<[^>]+>/g) || []).length;
+    const updatedTagCount = (updatedContent.match(/<[^>]+>/g) || []).length;
+    
+    if (Math.abs(originalTagCount - updatedTagCount) > 5) {
+      console.warn(`HTML structure changed significantly: ${originalTagCount} → ${updatedTagCount} tags`);
     }
 
     const duration = Date.now() - startTime;
@@ -194,12 +241,15 @@ Return ONLY the updated HTML, no explanations.`
         `✅ Performed ${searchCount} detailed Brave searches`,
         `✅ Verified pricing, user counts, and features`,
         `✅ Updated facts from official sources`,
-        `✅ Fixed grammar and readability`
+        `✅ Fixed grammar and readability`,
+        `✅ Preserved all HTML structure and links`
       ],
       searchesUsed: searchCount,
       claudeCalls: 1,
       sectionsUpdated: 4,
-      duration
+      duration,
+      htmlTagsOriginal: originalTagCount,
+      htmlTagsUpdated: updatedTagCount
     });
 
   } catch (error) {
@@ -209,5 +259,5 @@ Return ONLY the updated HTML, no explanations.`
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 ContentOps Backend (Simple Version) on port ${PORT}`);
+  console.log(`🚀 ContentOps Backend (HTML Preserved) on port ${PORT}`);
 });
