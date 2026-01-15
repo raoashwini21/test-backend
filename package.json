@@ -1,5 +1,5 @@
 {
-  "name": "contentops-backend",
+  "name": "test-backend",
   "version": "2.0.0",
   "type": "module",
   "description": "ContentOps Backend - Brave Search + Claude AI",
