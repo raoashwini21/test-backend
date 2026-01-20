@@ -309,6 +309,7 @@ CRITICAL INSTRUCTIONS:
 - Update ALL incorrect facts based on Brave Search
 - Fix pricing, features, stats for ALL entities mentioned
 - Preserve ALL HTML tags, structure, images, links EXACTLY
+- Preserve ALL <a> tags with href, target, and attributes EXACTLY
 - Preserve ALL heading tags (H1, H2, H3, H4, H5, H6) EXACTLY - do NOT change heading levels
 - Preserve ALL bold/italic formatting EXACTLY
 - Preserve ALL paragraph breaks and list structures EXACTLY
@@ -329,6 +330,7 @@ CRITICAL INSTRUCTIONS:
 - Update ALL incorrect facts based on Brave Search
 - Fix pricing, features, stats for ALL entities
 - Preserve ALL HTML tags, structure, images, links, widgets EXACTLY
+- Preserve ALL <a> tags with href, target, and attributes EXACTLY
 - Preserve ALL heading tags (H1, H2, H3, H4, H5, H6) EXACTLY - do NOT change heading levels
 - Preserve ALL bold/italic formatting EXACTLY  
 - Preserve ALL paragraph breaks and list structures EXACTLY
