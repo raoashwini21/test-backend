@@ -198,8 +198,11 @@ app.post('/api/analyze', async (req, res) => {
 
     // STAGE 1: Generate search queries (once for entire blog)
     console.log('Stage 1: Generate search queries...');
+    console.log('%c=== QUERY GENERATION ===', 'background: #8b5cf6; color: white; padding: 4px 8px; font-weight: bold;');
+    console.log('Blog title:', title);
+    console.log('Research type:', researchPrompt ? 'Custom' : 'Default');
     
-    const queryGenerationPrompt = `Analyze this blog post and generate 5-7 specific search queries for fact-checking.
+    const queryGenerationPrompt = `Analyze this blog post and generate 5-7 HIGHLY SPECIFIC search queries for fact-checking.
 
 RESEARCH INSTRUCTIONS:
 ${researchPrompt || 'Verify all claims, pricing, features, and statistics mentioned.'}
@@ -209,17 +212,40 @@ BLOG TITLE: ${title}
 BLOG CONTENT (first 3000 chars):
 ${blogContent.substring(0, 3000)}
 
+CRITICAL SEARCH QUERY RULES:
+1. For PRICING: Always use "site:companyname.com pricing 2025"
+2. For FEATURES: Use "site:companyname.com features 2025" or "companyname official features documentation"
+3. For STATISTICS: Use "companyname official statistics 2025" or authoritative sources
+4. For LIMITS/QUOTAS: Use "site:companyname.com limits" or "companyname official documentation limits"
+5. For COMPARISONS: Search official sources of BOTH products being compared
+6. ALWAYS prefer official sources: Use "site:" operator or include "official" keyword
+7. Include year "2025" or "2024" to get recent information
+8. AVOID generic queries that will return review sites or forums
+
 Generate search queries that will help verify:
-- All company/product names mentioned (pricing, features, stats)
-- All competitors mentioned (pricing, features, comparisons)
-- Industry statistics and benchmarks
-- Platform limits and policies
-- Technical specifications
+- Pricing (MUST use: "site:companyname.com pricing 2025")
+- Features (MUST use: "site:companyname.com features 2025" or "official documentation")
+- Statistics (Use official company reports or authoritative sources)
+- Platform limits/quotas (Use: "site:companyname.com limits" or official docs)
+- Technical specifications (Use: "site:companyname.com documentation" or official specs)
+
+EXAMPLE GOOD QUERIES (prioritize official sources):
+✅ "site:mailshake.com pricing plans 2025"
+✅ "site:linkedin.com connection limits official 2025"
+✅ "mailshake official features documentation"
+✅ "site:salesrobot.co automation capabilities 2025"
+✅ "email deliverability statistics official 2024"
+
+EXAMPLE BAD QUERIES (will get unreliable sources):
+❌ "mailshake pricing" (gets review sites)
+❌ "best email tools" (not specific)
+❌ "mailshake vs competitors" (gets comparison sites with wrong info)
+❌ "email automation features" (too generic)
 
 Return ONLY a JSON array of 5-7 search query strings. Example:
-["query 1", "query 2", "query 3", "query 4", "query 5"]
+["site:mailshake.com pricing 2025", "mailshake official features", "linkedin limits 2025 official"]
 
-Focus on entities actually mentioned in this blog.`;
+Focus on entities actually mentioned in this blog. Prioritize official sources with site: operator.`;
 
     const queryResponse = await anthropic.messages.create({
       model: 'claude-sonnet-4-20250514',
@@ -234,20 +260,26 @@ Focus on entities actually mentioned in this blog.`;
       const queryText = queryResponse.content[0].text.trim()
         .replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
       searchQueries = JSON.parse(queryText);
-      console.log('Generated search queries:', searchQueries);
+      console.log('%c✓ Generated search queries:', 'color: #10b981; font-weight: bold;');
+      searchQueries.forEach((q, i) => {
+        const isOfficialSource = q.includes('site:') || q.includes('official');
+        console.log(`  ${i + 1}. ${q} ${isOfficialSource ? '🔒 (official source)' : '⚠️ (generic)'}`);
+      });
     } catch (error) {
-      console.error('Failed to parse queries:', error);
+      console.error('%cFailed to parse queries:', 'color: #ef4444;', error);
       searchQueries = [`${title} pricing 2025`, `${title} features`, 'industry statistics 2025'];
+      console.log('Using fallback queries:', searchQueries);
     }
 
     // STAGE 2: Brave Search (once for entire blog)
     console.log('Stage 2: Brave Search...');
+    console.log('%c=== BRAVE SEARCH STARTING ===', 'background: #0ea5e9; color: white; padding: 4px 8px; font-weight: bold;');
     
     let researchFindings = '# BRAVE SEARCH FINDINGS\n\n';
 
     for (const query of searchQueries.slice(0, 6)) { // Limit to 6 searches
       try {
-        console.log(`Brave Search ${totalSearchesUsed + 1}: ${query}`);
+        console.log(`%cBrave Search ${totalSearchesUsed + 1}: ${query}`, 'color: #0ea5e9; font-weight: bold;');
         
         const braveResponse = await fetch(
           `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(query)}&count=5`,
@@ -265,24 +297,36 @@ Focus on entities actually mentioned in this blog.`;
           
           researchFindings += `## Query: "${query}"\n`;
           
+          console.log('%cSearch Results:', 'color: #10b981; font-weight: bold;');
+          
           if (braveData.web?.results) {
             braveData.web.results.slice(0, 3).forEach((result, i) => {
               researchFindings += `${i + 1}. **${result.title}**\n`;
               researchFindings += `   URL: ${result.url}\n`;
               researchFindings += `   ${result.description || ''}\n\n`;
+              
+              // LOG TO CONSOLE
+              console.log(`  ${i + 1}. ${result.title}`);
+              console.log(`     ${result.url}`);
+              console.log(`     ${result.description?.substring(0, 150) || '(no description)'}...`);
             });
+          } else {
+            console.log('%c  No results found', 'color: #f59e0b;');
           }
           researchFindings += '\n';
+        } else {
+          console.error('%cBrave API Error:', 'color: #ef4444; font-weight: bold;', braveResponse.status);
         }
         
         await new Promise(resolve => setTimeout(resolve, 400)); // Rate limit
         
       } catch (error) {
-        console.error(`Brave search failed for "${query}":`, error.message);
+        console.error(`%cBrave search failed for "${query}":`, 'color: #ef4444;', error.message);
       }
     }
 
-    console.log(`Research complete: ${totalSearchesUsed} searches, ${totalClaudeCalls} Claude calls`);
+    console.log('%c=== BRAVE SEARCH COMPLETE ===', 'background: #10b981; color: white; padding: 4px 8px; font-weight: bold;');
+    console.log(`Total searches: ${totalSearchesUsed}, Total Claude calls: ${totalClaudeCalls}`);
 
     // STAGE 3: Process each chunk with Claude
     console.log('Stage 3: Processing chunks...');
@@ -305,9 +349,28 @@ ${researchFindings}
 SECTION ${chunkNum} CONTENT:
 ${chunk}
 
-CRITICAL INSTRUCTIONS:
-- Update ALL incorrect facts based on Brave Search
-- Fix pricing, features, stats for ALL entities mentioned
+CRITICAL INSTRUCTIONS - ALL FACTS VERIFICATION:
+- ONLY update ANY fact (pricing, features, statistics, limits, capabilities) if Brave Search shows results from OFFICIAL sources:
+  * Official company websites (site:companyname.com)
+  * Official documentation (.com/docs, .com/help)
+  * Official blog posts (.com/blog)
+  * Government/institutional sites (.gov, .edu for statistics)
+- If information comes from:
+  * Review sites (g2.com, capterra.com, trustpilot.com)
+  * Comparison sites (alternativeto.net, etc.)
+  * Forums (reddit, quora)
+  * Outdated articles (before 2024)
+  → KEEP ORIGINAL TEXT - Do NOT update
+- When uncertain about ANY fact: KEEP ORIGINAL TEXT rather than guessing
+- If search results conflict or are unclear: DO NOT change the original content
+- Verify ALL claims:
+  * Pricing: Only from official pricing pages
+  * Features: Only from official feature lists/documentation
+  * Statistics: Only from official reports or authoritative sources
+  * Limits/quotas: Only from official documentation
+  * Technical specs: Only from official technical docs
+
+CRITICAL INSTRUCTIONS - FORMATTING:
 - Preserve ALL HTML tags, structure, images, links EXACTLY
 - Preserve ALL <a> tags with href, target, and attributes EXACTLY
 - Preserve ALL heading tags (H1, H2, H3, H4, H5, H6) EXACTLY - do NOT change heading levels
@@ -317,7 +380,9 @@ CRITICAL INSTRUCTIONS:
 - Use contractions, active voice
 - Return ONLY the rewritten HTML for this section
 - DO NOT add section headers or numbers
-- Keep the exact same HTML structure and heading hierarchy`
+- Keep the exact same HTML structure and heading hierarchy
+
+GOLDEN RULE: Better to keep original content than update with unverified information from non-official sources!`
         : `Based on the Brave search results, rewrite this complete blog post.
 
 BRAVE SEARCH RESULTS:
@@ -326,9 +391,28 @@ ${researchFindings}
 BLOG CONTENT:
 ${chunk}
 
-CRITICAL INSTRUCTIONS:
-- Update ALL incorrect facts based on Brave Search
-- Fix pricing, features, stats for ALL entities
+CRITICAL INSTRUCTIONS - ALL FACTS VERIFICATION:
+- ONLY update ANY fact (pricing, features, statistics, limits, capabilities) if Brave Search shows results from OFFICIAL sources:
+  * Official company websites (site:companyname.com)
+  * Official documentation (.com/docs, .com/help)
+  * Official blog posts (.com/blog)
+  * Government/institutional sites (.gov, .edu for statistics)
+- If information comes from:
+  * Review sites (g2.com, capterra.com, trustpilot.com)
+  * Comparison sites (alternativeto.net, etc.)
+  * Forums (reddit, quora)
+  * Outdated articles (before 2024)
+  → KEEP ORIGINAL TEXT - Do NOT update
+- When uncertain about ANY fact: KEEP ORIGINAL TEXT rather than guessing
+- If search results conflict or are unclear: DO NOT change the original content
+- Verify ALL claims:
+  * Pricing: Only from official pricing pages
+  * Features: Only from official feature lists/documentation
+  * Statistics: Only from official reports or authoritative sources
+  * Limits/quotas: Only from official documentation
+  * Technical specs: Only from official technical docs
+
+CRITICAL INSTRUCTIONS - FORMATTING:
 - Preserve ALL HTML tags, structure, images, links, widgets EXACTLY
 - Preserve ALL <a> tags with href, target, and attributes EXACTLY
 - Preserve ALL heading tags (H1, H2, H3, H4, H5, H6) EXACTLY - do NOT change heading levels
@@ -337,7 +421,9 @@ CRITICAL INSTRUCTIONS:
 - Remove em-dashes, banned words, long sentences
 - Use contractions, active voice
 - Return ONLY the complete rewritten HTML
-- NO explanations, just clean HTML with EXACT heading structure preserved`;
+- NO explanations, just clean HTML with EXACT heading structure preserved
+
+GOLDEN RULE: Better to keep original content than update with unverified information from non-official sources!`;
 
       const chunkResponse = await anthropic.messages.create({
         model: 'claude-sonnet-4-20250514',
@@ -347,6 +433,8 @@ CRITICAL INSTRUCTIONS:
       });
 
       totalClaudeCalls++;
+      
+      console.log(`%c✓ Chunk ${chunkNum} processed`, 'color: #10b981;', `(${chunkResponse.content[0].text.length} chars output)`);
 
       let rewrittenChunk = '';
       for (const block of chunkResponse.content) {
