@@ -2,6 +2,12 @@ import express from 'express';
 import cors from 'cors';
 import Anthropic from '@anthropic-ai/sdk';
 
+// ============================================
+// GOOGLE CUSTOM SEARCH API KEYS (Backend Only)
+// ============================================
+const GOOGLE_API_KEY = 'AIzaSyC-lvJ_gL12VfRrpyCxKGiY_qvGtnHkRjA';  // From: https://console.cloud.google.com/apis/credentials
+const GOOGLE_SEARCH_ENGINE_ID = '90a56bfbc96304c89';  // Your Search Engine ID
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -157,13 +163,13 @@ app.post('/api/analyze', async (req, res) => {
       blogContent, 
       title, 
       anthropicKey, 
-      braveKey,
+      braveKey,  // Received from frontend but not used (we use Google keys)
       researchPrompt,
       writingPrompt
     } = req.body;
 
-    if (!blogContent || !anthropicKey || !braveKey) {
-      return res.status(400).json({ error: 'Missing required fields' });
+    if (!blogContent || !anthropicKey) {
+      return res.status(400).json({ error: 'Missing required fields: blogContent, anthropicKey' });
     }
 
     const anthropic = new Anthropic({ apiKey: anthropicKey });
@@ -217,10 +223,18 @@ Generate search queries that will help verify:
 - Platform limits/quotas (Use: "site:companyname.com limits" or official docs)
 - Technical specifications (Use: "site:companyname.com documentation" or official specs)
 
+🤖 SPECIAL: If blog mentions SalesRobot, ALWAYS include these searches:
+- "site:salesrobot.co ai features 2025"
+- "salesrobot ai capabilities 2025"
+- "salesrobot ai message optimization"
+- "salesrobot artificial intelligence features"
+
 EXAMPLE GOOD QUERIES (focus on features, NOT pricing):
 ✅ "site:mailshake.com features 2025"
 ✅ "mailshake new features 2025"
 ✅ "mailshake ai features 2025"
+✅ "site:salesrobot.co ai features 2025" (ALWAYS include for SalesRobot blogs)
+✅ "salesrobot ai capabilities 2025" (ALWAYS include for SalesRobot blogs)
 ✅ "salesrobot new capabilities 2025"
 ✅ "salesrobot recent updates january 2025"
 ✅ "site:linkedin.com connection limits official 2025"
@@ -274,11 +288,11 @@ Focus on entities actually mentioned in this blog. Prioritize official sources. 
       console.log('Using fallback queries:', searchQueries);
     }
 
-    // STAGE 2: Brave Search (once for entire blog)
-    console.log('Stage 2: Brave Search...');
-    console.log('%c=== BRAVE SEARCH STARTING ===', 'background: #0ea5e9; color: white; padding: 4px 8px; font-weight: bold;');
+    // STAGE 2: Google Custom Search (once for entire blog)
+    console.log('Stage 2: Google Custom Search...');
+    console.log('%c=== GOOGLE CUSTOM SEARCH STARTING ===', 'background: #0ea5e9; color: white; padding: 4px 8px; font-weight: bold;');
     
-    let researchFindings = `# BRAVE SEARCH FINDINGS
+    let researchFindings = `# GOOGLE SEARCH FINDINGS
 
 ⚠️ IMPORTANT VERIFICATION NOTE:
 - Multiple searches help cross-verify features and facts
@@ -291,53 +305,51 @@ Focus on entities actually mentioned in this blog. Prioritize official sources. 
 
     for (const query of searchQueries.slice(0, 8)) {
       try {
-        console.log(`%cBrave Search ${totalSearchesUsed + 1}: ${query}`, 'color: #0ea5e9; font-weight: bold;');
+        console.log(`%cGoogle Search ${totalSearchesUsed + 1}: ${query}`, 'color: #0ea5e9; font-weight: bold;');
         
-        const braveResponse = await fetch(
-          `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(query)}&count=5`,
+        const googleResponse = await fetch(
+          `https://www.googleapis.com/customsearch/v1?key=${GOOGLE_API_KEY}&cx=${GOOGLE_SEARCH_ENGINE_ID}&q=${encodeURIComponent(query)}&num=5`,
           {
-            headers: {
-              'Accept': 'application/json',
-              'X-Subscription-Token': braveKey
-            }
+            headers: { 'Accept': 'application/json' }
           }
         );
 
-        if (braveResponse.ok) {
-          const braveData = await braveResponse.json();
+        if (googleResponse.ok) {
+          const googleData = await googleResponse.json();
           totalSearchesUsed++;
           
           researchFindings += `## Query: "${query}"\n`;
           
           console.log('%cSearch Results:', 'color: #10b981; font-weight: bold;');
           
-          if (braveData.web?.results) {
-            braveData.web.results.slice(0, 3).forEach((result, i) => {
+          if (googleData.items) {
+            googleData.items.slice(0, 3).forEach((result, i) => {
               researchFindings += `${i + 1}. **${result.title}**\n`;
-              researchFindings += `   URL: ${result.url}\n`;
-              researchFindings += `   ${result.description || ''}\n\n`;
+              researchFindings += `   URL: ${result.link}\n`;
+              researchFindings += `   ${result.snippet || ''}\n\n`;
               
               // LOG TO CONSOLE
               console.log(`  ${i + 1}. ${result.title}`);
-              console.log(`     ${result.url}`);
-              console.log(`     ${result.description?.substring(0, 150) || '(no description)'}...`);
+              console.log(`     ${result.link}`);
+              console.log(`     ${result.snippet?.substring(0, 150) || '(no snippet)'}...`);
             });
           } else {
             console.log('%c  No results found', 'color: #f59e0b;');
           }
           researchFindings += '\n';
         } else {
-          console.error('%cBrave API Error:', 'color: #ef4444; font-weight: bold;', braveResponse.status);
+          const errorData = await googleResponse.json();
+          console.error('%cGoogle API Error:', 'color: #ef4444; font-weight: bold;', googleResponse.status, errorData.error?.message || 'Unknown error');
         }
         
-        await new Promise(resolve => setTimeout(resolve, 400)); // Rate limit
+        await new Promise(resolve => setTimeout(resolve, 200)); // Rate limit
         
       } catch (error) {
-        console.error(`%cBrave search failed for "${query}":`, 'color: #ef4444;', error.message);
+        console.error(`%cGoogle search failed for "${query}":`, 'color: #ef4444;', error.message);
       }
     }
 
-    console.log('%c=== BRAVE SEARCH COMPLETE ===', 'background: #10b981; color: white; padding: 4px 8px; font-weight: bold;');
+    console.log('%c=== GOOGLE SEARCH COMPLETE ===', 'background: #10b981; color: white; padding: 4px 8px; font-weight: bold;');
     console.log(`Total searches: ${totalSearchesUsed}, Total Claude calls: ${totalClaudeCalls}`);
 
     // STAGE 3: Process each chunk with Claude
@@ -355,7 +367,7 @@ Focus on entities actually mentioned in this blog. Prioritize official sources. 
       const chunkPrompt = chunks.length > 1 
         ? `This is PART ${chunkNum} of ${chunks.length} of a blog post. Rewrite this section based on research findings.
 
-BRAVE SEARCH RESULTS:
+GOOGLE SEARCH RESULTS:
 ${researchFindings}
 
 SECTION ${chunkNum} CONTENT:
@@ -382,9 +394,29 @@ ${chunk}
   * Automation features (workflow automation, smart sequencing)
   * Analytics features (advanced reporting, tracking)
   * Recent product updates and launches
+
+🤖 SALESROBOT AI FEATURES - CRITICAL PRIORITY:
+- If blog mentions SalesRobot, ACTIVELY search for and ADD all AI features found in search results
+- SalesRobot AI features to look for (add ALL that are found):
+  * AI-powered message writing/optimization
+  * AI subject line generation  
+  * AI response suggestions
+  * AI sentiment analysis
+  * AI-powered personalization
+  * AI campaign optimization
+  * Machine learning for send times
+  * Predictive analytics
+  * Smart automation features
+- HOW TO ADD THEM:
+  * If blog uses bullet points → Add as new bullet points in relevant section
+  * If blog uses paragraphs → Add as new paragraph or integrate into existing paragraph
+  * Always use natural transition: "Additionally,", "Moreover,", "SalesRobot also offers", etc.
+  * Group AI features together if multiple found
+- EXAMPLE FORMATS:
+  * Bullet: "• AI-powered message optimization that analyzes and improves your outreach"
+  * Paragraph: "Additionally, SalesRobot now includes AI-powered message optimization, which analyzes your content and suggests improvements for better engagement."
+- Make it sound natural and valuable, not like a feature dump
 - If official source mentions feature NOT in blog → ADD IT
-- Format naturally: "Additionally, [Product] now offers [feature description]"
-- Example: "SalesRobot also includes AI-powered message optimization and automated LinkedIn post scheduling"
 
 SOURCE REQUIREMENTS:
 - ONLY trust OFFICIAL sources:
@@ -407,9 +439,9 @@ CRITICAL INSTRUCTIONS - FORMATTING:
 - Keep the exact same HTML structure and heading hierarchy
 
 GOLDEN RULE: Pricing stays unchanged. Focus on adding NEW features and updating capabilities.`
-        : `Based on the Brave search results, rewrite this complete blog post.
+        : `Based on the Google search results, rewrite this complete blog post.
 
-BRAVE SEARCH RESULTS:
+GOOGLE SEARCH RESULTS:
 ${researchFindings}
 
 BLOG CONTENT:
@@ -436,9 +468,29 @@ ${chunk}
   * Automation features (workflow automation, smart sequencing)
   * Analytics features (advanced reporting, tracking)
   * Recent product updates and launches
+
+🤖 SALESROBOT AI FEATURES - CRITICAL PRIORITY:
+- If blog mentions SalesRobot, ACTIVELY search for and ADD all AI features found in search results
+- SalesRobot AI features to look for (add ALL that are found):
+  * AI-powered message writing/optimization
+  * AI subject line generation  
+  * AI response suggestions
+  * AI sentiment analysis
+  * AI-powered personalization
+  * AI campaign optimization
+  * Machine learning for send times
+  * Predictive analytics
+  * Smart automation features
+- HOW TO ADD THEM:
+  * If blog uses bullet points → Add as new bullet points in relevant section
+  * If blog uses paragraphs → Add as new paragraph or integrate into existing paragraph
+  * Always use natural transition: "Additionally,", "Moreover,", "SalesRobot also offers", etc.
+  * Group AI features together if multiple found
+- EXAMPLE FORMATS:
+  * Bullet: "• AI-powered message optimization that analyzes and improves your outreach"
+  * Paragraph: "Additionally, SalesRobot now includes AI-powered message optimization, which analyzes your content and suggests improvements for better engagement."
+- Make it sound natural and valuable, not like a feature dump
 - If official source mentions feature NOT in blog → ADD IT
-- Format naturally: "Additionally, [Product] now offers [feature description]"
-- Example: "SalesRobot also includes AI-powered message optimization and automated LinkedIn post scheduling"
 
 SOURCE REQUIREMENTS:
 - ONLY trust OFFICIAL sources:
