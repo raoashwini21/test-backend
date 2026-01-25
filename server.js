@@ -1,12 +1,16 @@
+import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import Anthropic from '@anthropic-ai/sdk';
 
-// ============================================
-// GOOGLE CUSTOM SEARCH API KEYS (Backend Only)
-// ============================================
-const GOOGLE_API_KEY = 'AIzaSyC-lvJ_gL12VfRrpyCxKGiY_qvGtnHkRjA';  // From: https://console.cloud.google.com/apis/credentials
-const GOOGLE_SEARCH_ENGINE_ID = '90a56bfbc96304c89';  // Your Search Engine ID
+// Environment variables from Railway (secure)
+const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
+const GOOGLE_SEARCH_ENGINE_ID = process.env.GOOGLE_SEARCH_ENGINE_ID || '90a56bfbc96304c89';
+
+// Verify keys loaded
+if (!GOOGLE_API_KEY) {
+  console.error('⚠️ GOOGLE_API_KEY not found! Check Railway environment variables.');
+}
 
 const app = express();
 const PORT = process.env.PORT || 3000;
