@@ -1,398 +1,646 @@
-const express = require('express');
-const cors = require('cors');
-const fetch = require('node-fetch');
+import 'dotenv/config';
+import express from 'express';
+import cors from 'cors';
+import Anthropic from '@anthropic-ai/sdk';
+
+// ============================================
+// GOOGLE CUSTOM SEARCH API
+// ============================================
+const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
+const GOOGLE_SEARCH_ENGINE_ID = process.env.GOOGLE_SEARCH_ENGINE_ID || '90a56bfbc96304c89';
+
+if (!GOOGLE_API_KEY) {
+  console.error('⚠️ WARNING: GOOGLE_API_KEY not found in environment variables!');
+}
 
 const app = express();
-const PORT = process.env.PORT || 3001;
+const PORT = process.env.PORT || 3000;
 
-// Middleware
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 
-// Health check
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
-});
+const writingSystemPrompt = `You are an expert blog editor. You:
+1. Preserve ALL HTML structure, tags, classes, IDs exactly
+2. Preserve ALL heading levels (H1-H6) exactly - never change hierarchy
+3. Preserve ALL links with href, target, rel attributes exactly
+4. Preserve ALL images, iframes, embeds, widgets, scripts exactly
+5. Preserve ALL paragraph breaks, lists, tables exactly
+6. Fix factual errors based on research
+7. Remove em-dashes, shorten sentences, use contractions
+8. Use active voice
+9. Return ONLY HTML, no markdown`;
 
-// ===== MAIN ANALYSIS ENDPOINT =====
-app.post('/api/analyze', async (req, res) => {
+// ============================================
+// BACKEND BLOG CACHE (Solves Concurrent User Issues)
+// ============================================
+let blogCache = {
+  data: null,
+  timestamp: null,
+  collectionId: null,
+  isRefreshing: false
+};
+
+const CACHE_DURATION = 10 * 60 * 1000; // 10 minutes
+
+// Fetch all blogs from Webflow
+async function fetchAllBlogsFromWebflow(collectionId, webflowToken) {
+  console.log('📥 Fetching all blogs from Webflow...');
   const startTime = Date.now();
   
-  try {
-    const { 
-      blogContent, 
-      title, 
-      anthropicKey, 
-      braveKey, 
-      researchPrompt,
-      writingPrompt,
-      gscKeywords  // NEW: GSC keywords array
-    } = req.body;
-    
-    // Validation
-    if (!anthropicKey) {
-      return res.status(400).json({ error: 'Anthropic API key missing' });
-    }
-    
-    if (!braveKey) {
-      return res.status(400).json({ error: 'Brave API key missing' });
-    }
-    
-    if (!blogContent || !title) {
-      return res.status(400).json({ error: 'Blog content and title required' });
-    }
-    
-    console.log('=== ANALYSIS REQUEST ===');
-    console.log('Blog title:', title);
-    console.log('Content length:', blogContent.length);
-    console.log('GSC keywords:', gscKeywords ? gscKeywords.length : 0);
-    
-    // Build enhanced prompt with GSC data
-    let enhancedWritingPrompt = writingPrompt;
-    
-    if (gscKeywords && gscKeywords.length > 0) {
-      // Sort by position (best opportunities first)
-      const sortedKeywords = gscKeywords
-        .sort((a, b) => a.position - b.position)
-        .slice(0, 10); // Top 10 opportunities
-      
-      const gscSection = `
+  const allItems = [];
+  const limit = 100;
+  let offset = 0;
+  let hasMore = true;
 
-**CRITICAL: GSC KEYWORD OPTIMIZATION (HIGH PRIORITY)**
-
-You have access to Google Search Console data showing keyword opportunities for this blog.
-These keywords are ALREADY ranking but need optimization to rank higher.
-
-Top Keyword Opportunities (Positions 4-20):
-${sortedKeywords.map((k, i) => `
-${i + 1}. "${k.query}"
-   - Current Position: ${k.position.toFixed(1)}
-   - Clicks/month: ${k.clicks}
-   - Impressions: ${k.impressions}
-   ${k.position <= 10 ? '   🎯 HIGH PRIORITY: Almost Page 1!' : ''}
-   ${k.position > 10 && k.position <= 15 ? '   🔍 MEDIUM PRIORITY: Good potential' : ''}
-   ${k.position > 15 ? '   💡 LOW PRIORITY: Long-term play' : ''}
-`).join('')}
-
-**YOUR GSC OPTIMIZATION TASKS:**
-
-1. **Optimize Existing Headings:**
-   - If a heading is SIMILAR to a GSC keyword, change it to the EXACT keyword
-   - Example: "Top Automation Tools" → "LinkedIn Automation Tools" (if that's the keyword)
-   - Keep heading level the same (H2 stays H2)
-
-2. **Add New Sections for Missing Keywords:**
-   - If a high-priority keyword is NOT in any heading, add a new section
-   - Use the exact keyword as the heading
-   - Write 2-3 paragraphs of relevant content
-
-3. **FAQ Sections for Question Keywords:**
-   - Keywords starting with "how", "is", "what", "why", "can" = Questions
-   - Add as H3 with the exact question
-   - Provide a direct answer in the next paragraph
-
-4. **Keyword Integration Rules:**
-   - Use EXACT keyword phrases from GSC (don't paraphrase)
-   - Make it natural (not keyword-stuffed)
-   - Prioritize keywords with position 4-10 (almost Page 1)
-   - Add keywords to headings AND body text naturally
-
-5. **What NOT to Do:**
-   - Don't change heading hierarchy (H2 → H3 etc)
-   - Don't keyword stuff (use each keyword 2-3 times max)
-   - Don't remove existing good content
-   - Don't force keywords where they don't fit naturally
-
-**REMEMBER:** GSC keywords take PRIORITY over general rewrites. If you must choose between a small style improvement and adding a GSC keyword, ALWAYS add the GSC keyword.
-`;
-      
-      enhancedWritingPrompt = writingPrompt + gscSection;
-    }
+  while (hasMore) {
+    const url = `https://api.webflow.com/v2/collections/${collectionId}/items?limit=${limit}&offset=${offset}`;
     
-    // Call Claude for analysis
-    console.log('Calling Claude API...');
-    const claudeResponse = await callClaude({
-      blogContent,
-      title,
-      anthropicKey,
-      braveKey,
-      researchPrompt,
-      writingPrompt: enhancedWritingPrompt
-    });
-    
-    const duration = Date.now() - startTime;
-    
-    console.log('✅ Analysis complete');
-    console.log('Duration:', duration, 'ms');
-    console.log('Changes:', claudeResponse.changes?.length || 0);
-    
-    res.json({
-      ...claudeResponse,
-      duration,
-      gscOptimized: gscKeywords && gscKeywords.length > 0
-    });
-    
-  } catch (error) {
-    console.error('❌ Analysis error:', error);
-    res.status(500).json({ 
-      error: error.message || 'Analysis failed',
-      details: process.env.NODE_ENV === 'development' ? error.stack : undefined
-    });
-  }
-});
-
-// ===== CLAUDE API CALL =====
-async function callClaude({ blogContent, title, anthropicKey, braveKey, researchPrompt, writingPrompt }) {
-  try {
-    // Step 1: Research phase (with Brave Search)
-    console.log('Step 1: Research phase with Claude + Brave...');
-    
-    const researchResponse = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
+    const response = await fetch(url, {
       headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': anthropicKey,
-        'anthropic-version': '2023-06-01'
-      },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-20250514',
-        max_tokens: 4000,
-        tools: [{
-          type: 'brave_search_20241119',
-          name: 'brave_search',
-          brave_api_key: braveKey
-        }],
-        messages: [{
-          role: 'user',
-          content: `${researchPrompt}
-
-Blog Title: ${title}
-
-Blog Content (first 8000 chars):
-${blogContent.substring(0, 8000)}
-
-Please fact-check this content and identify any:
-1. Incorrect pricing/features
-2. Outdated information
-3. Broken or incorrect claims
-4. Missing important recent developments
-
-Return your findings as structured JSON with this format:
-{
-  "factChecks": [
-    {
-      "issue": "Description of what's wrong",
-      "original": "Original text from blog",
-      "correction": "Corrected text",
-      "source": "URL or source of correct info",
-      "priority": "high" | "medium" | "low"
-    }
-  ],
-  "searchesUsed": 5
-}`
-        }]
-      })
-    });
-    
-    if (!researchResponse.ok) {
-      const errorData = await researchResponse.json();
-      throw new Error(`Claude research failed: ${errorData.error?.message || researchResponse.statusText}`);
-    }
-    
-    const researchData = await researchResponse.json();
-    console.log('Research complete:', researchData.usage);
-    
-    // Extract research findings
-    let factChecks = [];
-    let searchesUsed = 0;
-    
-    try {
-      const textContent = researchData.content
-        .filter(block => block.type === 'text')
-        .map(block => block.text)
-        .join('\n');
-      
-      // Try to parse JSON from response
-      const jsonMatch = textContent.match(/\{[\s\S]*"factChecks"[\s\S]*\}/);
-      if (jsonMatch) {
-        const parsed = JSON.parse(jsonMatch[0]);
-        factChecks = parsed.factChecks || [];
-        searchesUsed = parsed.searchesUsed || 0;
+        'Authorization': `Bearer ${webflowToken}`,
+        'accept': 'application/json'
       }
-    } catch (e) {
-      console.log('Could not parse research JSON, continuing anyway');
-    }
-    
-    console.log(`Found ${factChecks.length} fact-check issues`);
-    
-    // Step 2: Writing phase (apply corrections + GSC optimizations)
-    console.log('Step 2: Applying corrections and GSC optimizations...');
-    
-    const writingResponse = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': anthropicKey,
-        'anthropic-version': '2023-06-01'
-      },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-20250514',
-        max_tokens: 16000,
-        messages: [{
-          role: 'user',
-          content: `${writingPrompt}
-
-Blog Title: ${title}
-
-Original Blog Content:
-${blogContent}
-
-${factChecks.length > 0 ? `
-Fact-Check Corrections to Apply:
-${factChecks.map((fc, i) => `
-${i + 1}. ${fc.issue}
-   Original: "${fc.original}"
-   Correction: "${fc.correction}"
-   Source: ${fc.source}
-`).join('\n')}
-` : ''}
-
-Please rewrite the blog applying:
-1. All fact-check corrections above
-2. GSC keyword optimizations (if provided in the prompt)
-3. Style improvements (remove em-dashes, shorten sentences, etc.)
-
-Return ONLY the complete rewritten HTML content. No explanations, no markdown fences, just the HTML.`
-        }]
-      })
     });
-    
-    if (!writingResponse.ok) {
-      const errorData = await writingResponse.json();
-      throw new Error(`Claude writing failed: ${errorData.error?.message || writingResponse.statusText}`);
+
+    if (!response.ok) {
+      throw new Error(`Webflow API error: ${response.status}`);
     }
-    
-    const writingData = await writingResponse.json();
-    console.log('Writing complete:', writingData.usage);
-    
-    // Extract updated content
-    const updatedContent = writingData.content
-      .filter(block => block.type === 'text')
-      .map(block => block.text)
-      .join('\n')
-      .trim();
-    
-    return {
-      content: updatedContent,
-      originalContent: blogContent,
-      changes: factChecks,
-      searchesUsed,
-      claudeCalls: 2,
-      sectionsUpdated: factChecks.length
-    };
-    
-  } catch (error) {
-    console.error('Claude API error:', error);
-    throw error;
+
+    const data = await response.json();
+    const items = data.items || [];
+
+    console.log(`  Batch: offset=${offset}, received=${items.length} items`);
+
+    allItems.push(...items);
+
+    if (items.length < limit) {
+      hasMore = false;
+    } else {
+      offset += limit;
+      await new Promise(resolve => setTimeout(resolve, 300));
+    }
   }
+
+  // DEDUPLICATE by ID
+  const uniqueItems = [];
+  const seenIds = new Set();
+  
+  for (const item of allItems) {
+    if (!seenIds.has(item.id)) {
+      seenIds.add(item.id);
+      uniqueItems.push(item);
+    }
+  }
+
+  const duplicatesRemoved = allItems.length - uniqueItems.length;
+  
+  const duration = ((Date.now() - startTime) / 1000).toFixed(1);
+  console.log(`✅ Fetched ${allItems.length} blogs from Webflow in ${duration}s`);
+  if (duplicatesRemoved > 0) {
+    console.log(`⚠️ Removed ${duplicatesRemoved} duplicates → ${uniqueItems.length} unique blogs`);
+  } else {
+    console.log(`✓ All ${uniqueItems.length} blogs are unique (no duplicates)`);
+  }
+
+  return { items: uniqueItems };
 }
 
-// ===== WEBFLOW PROXY ENDPOINTS =====
+// Check if cache is valid
+function isCacheValid(collectionId) {
+  if (!blogCache.data) return false;
+  if (blogCache.collectionId !== collectionId) return false;
+  if (!blogCache.timestamp) return false;
+  
+  const age = Date.now() - blogCache.timestamp;
+  return age < CACHE_DURATION;
+}
 
-// GET blogs from Webflow
+// ============================================
+// CACHED WEBFLOW API PROXY
+// ============================================
 app.get('/api/webflow', async (req, res) => {
   try {
-    const { collectionId, limit = 100, offset = 0 } = req.query;
-    const authHeader = req.headers.authorization;
-    
-    if (!authHeader) {
-      return res.status(401).json({ error: 'Authorization header missing' });
+    const { collectionId, itemId, limit, offset } = req.query;
+    const webflowToken = req.headers.authorization?.replace('Bearer ', '');
+
+    if (!webflowToken || !collectionId) {
+      return res.status(400).json({ error: 'Missing Webflow token or collection ID' });
     }
-    
-    const token = authHeader.replace('Bearer ', '');
-    
-    const response = await fetch(
-      `https://api.webflow.com/v2/collections/${collectionId}/items?limit=${limit}&offset=${offset}`,
-      {
+
+    // Single item fetch (not cached)
+    if (itemId) {
+      console.log(`📄 Fetching single item: ${itemId}`);
+      const url = `https://api.webflow.com/v2/collections/${collectionId}/items/${itemId}`;
+      
+      const response = await fetch(url, {
         headers: {
-          'Authorization': `Bearer ${token}`,
+          'Authorization': `Bearer ${webflowToken}`,
           'accept': 'application/json'
         }
+      });
+
+      const data = await response.json();
+      
+      if (!response.ok) {
+        return res.status(response.status).json(data);
       }
-    );
-    
-    if (!response.ok) {
-      const errorData = await response.json();
-      return res.status(response.status).json(errorData);
+
+      return res.json(data);
     }
-    
-    const data = await response.json();
-    res.json(data);
-    
+
+    // List fetch - USE CACHE
+    console.log('📋 Blog list request received');
+
+    // Check if cache is valid
+    if (isCacheValid(collectionId)) {
+      const cacheAge = Math.round((Date.now() - blogCache.timestamp) / 1000);
+      console.log(`✅ Cache HIT! Serving ${blogCache.data.items.length} blogs (age: ${cacheAge}s)`);
+      
+      res.set('X-Cache', 'HIT');
+      res.set('X-Cache-Age', cacheAge.toString());
+      
+      return res.json(blogCache.data);
+    }
+
+    // Cache miss or expired - fetch fresh data
+    const cacheStatus = !blogCache.data ? 'EMPTY' : 'EXPIRED';
+    console.log(`❌ Cache ${cacheStatus} - fetching from Webflow...`);
+
+    // Prevent multiple concurrent fetches
+    if (blogCache.isRefreshing) {
+      console.log('⏳ Waiting for ongoing refresh...');
+      const maxWait = 180000; // 3 minutes
+      const waitStart = Date.now();
+      
+      while (blogCache.isRefreshing && (Date.now() - waitStart) < maxWait) {
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      }
+      
+      if (isCacheValid(collectionId)) {
+        console.log('✅ Cache populated by concurrent request');
+        res.set('X-Cache', 'WAIT-HIT');
+        return res.json(blogCache.data);
+      }
+    }
+
+    blogCache.isRefreshing = true;
+
+    try {
+      const freshData = await fetchAllBlogsFromWebflow(collectionId, webflowToken);
+      
+      blogCache.data = freshData;
+      blogCache.timestamp = Date.now();
+      blogCache.collectionId = collectionId;
+      
+      res.set('X-Cache', 'MISS');
+      res.set('X-Cache-Age', '0');
+      
+      res.json(freshData);
+    } finally {
+      blogCache.isRefreshing = false;
+    }
+
   } catch (error) {
-    console.error('Webflow GET error:', error);
+    console.error('Webflow API error:', error);
+    blogCache.isRefreshing = false;
     res.status(500).json({ error: error.message });
   }
 });
 
-// PATCH blog to Webflow
+// Cache status endpoint
+app.get('/api/cache-status', (req, res) => {
+  const cacheAge = blogCache.timestamp ? Math.round((Date.now() - blogCache.timestamp) / 1000) : null;
+  const isValid = isCacheValid(blogCache.collectionId);
+  
+  res.json({
+    hasCachedData: !!blogCache.data,
+    itemCount: blogCache.data?.items?.length || 0,
+    cacheAgeSeconds: cacheAge,
+    isValid: isValid,
+    collectionId: blogCache.collectionId,
+    isRefreshing: blogCache.isRefreshing,
+    cacheDurationSeconds: CACHE_DURATION / 1000
+  });
+});
+
+// Force cache clear
+app.post('/api/cache-clear', (req, res) => {
+  console.log('🗑️ Cache manually cleared');
+  blogCache.data = null;
+  blogCache.timestamp = null;
+  blogCache.collectionId = null;
+  res.json({ success: true, message: 'Cache cleared' });
+});
+
+// ============================================
+// WEBFLOW UPDATE
+// ============================================
 app.patch('/api/webflow', async (req, res) => {
   try {
     const { collectionId, itemId } = req.query;
+    const webflowToken = req.headers.authorization?.replace('Bearer ', '');
     const { fieldData } = req.body;
-    const authHeader = req.headers.authorization;
-    
-    if (!authHeader) {
-      return res.status(401).json({ error: 'Authorization header missing' });
+
+    if (!webflowToken || !collectionId || !itemId || !fieldData) {
+      return res.status(400).json({ error: 'Missing required fields' });
     }
+
+    console.log(`📝 Updating item ${itemId}...`);
+
+    const url = `https://api.webflow.com/v2/collections/${collectionId}/items/${itemId}`;
     
-    const token = authHeader.replace('Bearer ', '');
-    
-    console.log('Publishing to Webflow:', {
-      collectionId,
-      itemId,
-      titleLength: fieldData.name?.length,
-      contentLength: fieldData['post-body']?.length
+    const response = await fetch(url, {
+      method: 'PATCH',
+      headers: {
+        'Authorization': `Bearer ${webflowToken}`,
+        'Content-Type': 'application/json',
+        'accept': 'application/json'
+      },
+      body: JSON.stringify({ fieldData })
     });
-    
-    const response = await fetch(
-      `https://api.webflow.com/v2/collections/${collectionId}/items/${itemId}`,
-      {
-        method: 'PATCH',
-        headers: {
-          'Authorization': `Bearer ${token}`,
-          'Content-Type': 'application/json',
-          'accept': 'application/json'
-        },
-        body: JSON.stringify({ fieldData })
-      }
-    );
-    
+
     const data = await response.json();
     
     if (!response.ok) {
       console.error('Webflow PATCH error:', data);
       return res.status(response.status).json(data);
     }
+
+    console.log('✅ Item updated successfully');
     
-    console.log('✅ Published successfully');
+    // Invalidate cache after update
+    if (blogCache.collectionId === collectionId) {
+      console.log('🔄 Cache invalidated due to item update');
+      blogCache.timestamp = 0;
+    }
+
     res.json(data);
-    
   } catch (error) {
-    console.error('Webflow PATCH error:', error);
+    console.error('Webflow update error:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// Start server
-app.listen(PORT, () => {
-  console.log('=================================');
-  console.log('🚀 ContentOps Backend Started');
-  console.log('=================================');
-  console.log(`Port: ${PORT}`);
-  console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
-  console.log(`Time: ${new Date().toISOString()}`);
-  console.log('=================================');
+// ============================================
+// SMART ANALYSIS ENDPOINT (WITH GSC SUPPORT)
+// ============================================
+app.post('/api/analyze', async (req, res) => {
+  try {
+    const { 
+      blogContent, 
+      title, 
+      anthropicKey, 
+      braveKey,
+      researchPrompt,
+      writingPrompt,
+      gscKeywords,      // 🆕 GSC keywords array
+      gscPosition       // 🆕 Current GSC position
+    } = req.body;
+
+    if (!blogContent || !anthropicKey) {
+      return res.status(400).json({ error: 'Missing required fields' });
+    }
+
+    const anthropic = new Anthropic({ apiKey: anthropicKey });
+    
+    let totalSearchesUsed = 0;
+    let totalClaudeCalls = 0;
+    let allChanges = [];
+
+    const startTime = Date.now();
+
+    // 🆕 GSC MODE DETECTION
+    const isGscMode = gscKeywords && Array.isArray(gscKeywords) && gscKeywords.length > 0;
+    
+    if (isGscMode) {
+      console.log(`\n🎯 GSC MODE: Optimizing with ${gscKeywords.length} keywords + web search`);
+      console.log(`   Keywords: ${gscKeywords.slice(0, 5).join(', ')}${gscKeywords.length > 5 ? '...' : ''}`);
+      if (gscPosition) {
+        console.log(`   Current position: ${gscPosition.toFixed(1)}`);
+      }
+    }
+
+    // ============================================
+    // STAGE 1: QUERY GENERATION (ALWAYS RUN)
+    // ============================================
+    console.log('=== STAGE 1: QUERY GENERATION ===');
+      
+    console.log('=== STAGE 1: QUERY GENERATION ===');
+    
+    const queryPrompt = `Generate 6-8 search queries to fact-check this blog: "${title}"
+
+BLOG EXCERPT:
+${blogContent.substring(0, 3000)}
+
+RULES:
+1. Use "site:companyname.com" for official sources
+2. Search for "new features 2025", "ai features 2025"
+3. Target specific products/tools mentioned
+4. DO NOT generate pricing queries (manual verification)
+5. Include year "2025" for latest info
+
+🤖 SPECIAL: If SalesRobot mentioned, ALWAYS include:
+- "site:salesrobot.co ai features 2025"
+- "salesrobot ai capabilities 2025"
+- "salesrobot ai message optimization"
+
+GOOD: "site:mailshake.com features 2025", "mailshake ai features 2025"
+BAD: "mailshake pricing", "best email tools"
+
+Return JSON array: ["query1", "query2", ...]`;
+
+    const queryResponse = await anthropic.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 1000,
+      messages: [{ role: 'user', content: queryPrompt }]
+    });
+
+    totalClaudeCalls++;
+
+    let searchQueries = [];
+    try {
+      const queryText = queryResponse.content[0].text.trim()
+        .replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+      searchQueries = JSON.parse(queryText);
+      console.log('✓ Generated queries:');
+      searchQueries.forEach((q, i) => {
+        const isPricing = q.toLowerCase().includes('pric');
+        console.log(`  ${i + 1}. ${q} ${isPricing ? '⚠️ PRICING' : '✓'}`);
+      });
+    } catch (e) {
+      console.error('Query parse failed:', e);
+      searchQueries = [];
+    }
+
+    if (searchQueries.length === 0) {
+      return res.status(400).json({ error: 'Failed to generate queries' });
+    }
+
+    // ============================================
+    // STAGE 2: HYBRID SEARCH (ALWAYS RUN)
+    // ============================================
+    console.log('\n=== STAGE 2: HYBRID SEARCH ===');
+      
+    console.log('\n=== STAGE 2: HYBRID SEARCH ===');
+    
+    // Separate queries by type
+    const pricingQueries = [];
+    const featureQueries = [];
+    
+    searchQueries.slice(0, 8).forEach(q => {
+      const isPricing = q.toLowerCase().includes('pric') || 
+                       q.toLowerCase().includes('cost') ||
+                       q.toLowerCase().includes('plan');
+      if (isPricing) {
+        pricingQueries.push(q);
+      } else {
+        featureQueries.push(q);
+      }
+    });
+    
+    console.log(`Distribution: ${featureQueries.length} Brave + ${pricingQueries.length} Google`);
+    
+    let findings = `# RESEARCH FINDINGS\n\n`;
+
+    // PART A: BRAVE SEARCH (Features)
+      if (featureQueries.length > 0 && braveKey) {
+        console.log('\n--- BRAVE SEARCH (Features) ---');
+        
+        for (const query of featureQueries) {
+          try {
+            console.log(`Brave ${totalSearchesUsed + 1}: ${query}`);
+            
+            const braveResponse = await fetch(
+              `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(query)}&count=5`,
+              {
+                headers: {
+                  'Accept': 'application/json',
+                  'X-Subscription-Token': braveKey
+                }
+              }
+            );
+
+            if (braveResponse.ok) {
+              const braveData = await braveResponse.json();
+              totalSearchesUsed++;
+              
+              findings += `## "${query}" [BRAVE]\n`;
+              
+              if (braveData.web?.results) {
+                braveData.web.results.slice(0, 3).forEach((r, i) => {
+                  findings += `${i + 1}. **${r.title}**\n   ${r.url}\n   ${r.description || ''}\n\n`;
+                  console.log(`  ${i + 1}. ${r.title.substring(0, 60)}...`);
+                });
+              }
+              findings += '\n';
+            } else {
+              console.error(`Brave error: ${braveResponse.status}`);
+            }
+            
+            await new Promise(r => setTimeout(r, 400));
+            
+          } catch (error) {
+            console.error(`Brave failed: ${error.message}`);
+          }
+        }
+      }
+
+      // PART B: GOOGLE SEARCH (Pricing)
+      if (pricingQueries.length > 0 && GOOGLE_API_KEY) {
+        console.log('\n--- GOOGLE SEARCH (Pricing) ---');
+        
+        for (const query of pricingQueries) {
+          try {
+            console.log(`Google ${totalSearchesUsed + 1}: ${query}`);
+            
+            const googleResponse = await fetch(
+              `https://www.googleapis.com/customsearch/v1?key=${GOOGLE_API_KEY}&cx=${GOOGLE_SEARCH_ENGINE_ID}&q=${encodeURIComponent(query)}&num=5`,
+              { headers: { 'Accept': 'application/json' } }
+            );
+
+            if (googleResponse.ok) {
+              const googleData = await googleResponse.json();
+              totalSearchesUsed++;
+              
+              findings += `## "${query}" [GOOGLE-PRICING]\n`;
+              
+              if (googleData.items) {
+                googleData.items.slice(0, 3).forEach((r, i) => {
+                  findings += `${i + 1}. **${r.title}**\n   ${r.link}\n   ${r.snippet || ''}\n\n`;
+                  console.log(`  ${i + 1}. ${r.title.substring(0, 60)}...`);
+                });
+              }
+              findings += '\n';
+            } else {
+              const err = await googleResponse.json();
+              console.error(`Google error: ${err.error?.message || googleResponse.status}`);
+            }
+            
+            await new Promise(r => setTimeout(r, 200));
+            
+          } catch (error) {
+            console.error(`Google failed: ${error.message}`);
+          }
+        }
+      }
+
+      console.log(`\n✓ Search complete: ${totalSearchesUsed} total`);
+
+    // ============================================
+    // STAGE 3: CONTENT REWRITING (WITH GSC + SEARCH)
+    // ============================================
+    console.log('\n=== STAGE 3: CONTENT REWRITING ===');
+
+    const MAX_CHUNK = 15000;
+    let chunks = [];
+    
+    if (blogContent.length > MAX_CHUNK) {
+      console.log(`Chunking ${blogContent.length} chars...`);
+      const sections = blogContent.split(/(<h[1-6][^>]*>.*?<\/h[1-6]>)/gi);
+      let current = '';
+      
+      for (const section of sections) {
+        if (current.length + section.length > MAX_CHUNK && current.length > 0) {
+          chunks.push(current);
+          current = section;
+        } else {
+          current += section;
+        }
+      }
+      
+      if (current) chunks.push(current);
+      console.log(`Split into ${chunks.length} chunks`);
+    } else {
+      chunks = [blogContent];
+    }
+
+    let finalContent = '';
+    
+    for (let i = 0; i < chunks.length; i++) {
+      const chunk = chunks[i];
+      
+      console.log(`Processing chunk ${i + 1}/${chunks.length}...`);
+
+      // 🆕 BUILD REWRITE PROMPT (ALWAYS USE SEARCH FINDINGS + GSC IF AVAILABLE)
+      let rewritePrompt = '';
+      
+      if (isGscMode) {
+        // 🆕 GSC + SEARCH MODE: Use both!
+        const questionWords = ['how', 'what', 'why', 'when', 'where', 'is', 'are', 'can', 'does', 'do'];
+        const questionKeywords = gscKeywords.filter(k => 
+          questionWords.some(q => k.toLowerCase().startsWith(q + ' ') || k.toLowerCase().startsWith(q + "'"))
+        );
+        
+        const hasQuestions = questionKeywords.length > 0;
+        
+        rewritePrompt = `Optimize this content using BOTH search findings AND GSC keywords.
+
+📚 SEARCH FINDINGS:
+${findings}
+
+🎯 TARGET KEYWORDS (Top ${gscKeywords.length}):
+${gscKeywords.map((k, i) => `${i + 1}. ${k}`).join('\n')}
+
+${gscPosition ? `📊 Current position: ${gscPosition.toFixed(1)} (improve this!)` : ''}
+
+CONTENT:
+${chunk}
+
+✅ OPTIMIZATION RULES:
+1. Fix factual errors using search findings
+2. Add NEW features from official sources (search results)
+3. Naturally integrate ALL ${gscKeywords.length} GSC keywords
+4. Target keyword density: 1-2% (not forced)
+5. Use keywords in subheadings where natural
+6. Keep ALL HTML structure exact (headings, lists, links, images)
+
+${hasQuestions ? `
+🤔 FAQ SECTION (MANDATORY):
+You detected ${questionKeywords.length} question keyword(s):
+${questionKeywords.map((k, i) => `${i + 1}. ${k}`).join('\n')}
+
+Add FAQ section at the end:
+<h3>Frequently Asked Questions</h3>
+
+For EACH question keyword, create:
+<h4>Question based on keyword?</h4>
+<p>Comprehensive answer (2-3 sentences)</p>
+` : ''}
+
+⚠️ NEVER update pricing (manual verification only)
+✅ Preserve ALL HTML structure exactly
+
+Return ONLY rewritten HTML${hasQuestions ? ' with FAQ section at the end' : ''}, no explanations.`;
+
+      } else {
+        // NORMAL MODE: Just search findings
+        rewritePrompt = `Rewrite based on search findings.
+
+SEARCH RESULTS:
+${findings}
+
+CONTENT:
+${chunk}
+
+RULES:
+⚠️ NEVER update pricing (manual verification only)
+✅ Add NEW features from official sources
+✅ Add AI features if found
+✅ Update stats from authoritative sources
+✅ Preserve ALL HTML structure exactly
+✅ Keep heading levels exact (H1-H6)
+✅ Keep all links, images, widgets exact
+
+🤖 SALESROBOT: If mentioned, ADD AI features found:
+- AI message optimization
+- AI subject lines
+- AI personalization
+- Smart automation
+Add naturally with "Additionally," or "Moreover,"
+
+Return ONLY rewritten HTML, no explanations.`;
+      }
+
+      const rewriteResponse = await anthropic.messages.create({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 16000,
+        system: writingSystemPrompt,
+        messages: [{ role: 'user', content: rewritePrompt }]
+      });
+
+      totalClaudeCalls++;
+      finalContent += rewriteResponse.content[0].text.trim();
+      
+      console.log(`✓ Chunk ${i + 1} complete`);
+    }
+
+    const duration = ((Date.now() - startTime) / 1000).toFixed(1);
+    
+    console.log(`\n✅ COMPLETE: ${duration}s | ${totalSearchesUsed} searches | ${totalClaudeCalls} Claude calls`);
+    if (isGscMode) {
+      console.log(`   GSC: Optimized with ${gscKeywords.length} keywords`);
+    }
+    console.log('');
+
+    res.json({
+      content: finalContent,
+      changes: allChanges,
+      searchesUsed: totalSearchesUsed,
+      claudeCalls: totalClaudeCalls,
+      sectionsUpdated: chunks.length,
+      duration: parseFloat(duration),
+      gscOptimized: isGscMode  // 🆕 Flag indicating GSC optimization
+    });
+
+  } catch (error) {
+    console.error('Analysis error:', error);
+    res.status(500).json({ error: error.message });
+  }
 });
 
-module.exports = app;
+app.listen(PORT, () => {
+  console.log(`🚀 ContentOps backend: port ${PORT}`);
+  console.log(`🔍 Google Search: ${GOOGLE_API_KEY ? '✓' : '✗ (pricing skipped)'}`);
+  console.log(`💾 Blog cache: Enabled (${CACHE_DURATION / 1000}s TTL)`);
+  console.log(`🎯 GSC keyword optimization: Enabled`);
+});
