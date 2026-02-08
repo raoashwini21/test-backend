@@ -43,6 +43,30 @@ async function fetchAllBlogs(collectionId, token) {
 }
 
 // ════════════════════════════════════════════
+// WIDGET PROTECTION - Prevents Claude from stripping embeds
+// ════════════════════════════════════════════
+function protectWidgets(html) {
+  const widgets = [];
+  const protectedHtml = html.replace(
+    /(<(?:iframe|script|embed|object)[^>]*>(?:[\s\S]*?<\/(?:iframe|script|embed|object)>)?)|(<div[^>]*class="[^"]*(?:w-embed|w-widget|widget|embed)[^"]*"[^>]*>[\s\S]*?<\/div>)|(<figure[^>]*>[\s\S]*?<\/figure>)|(<video[^>]*>[\s\S]*?<\/video>)/gi,
+    (match) => {
+      const id = `___WIDGET_${widgets.length}___`;
+      widgets.push(match);
+      return id;
+    }
+  );
+  return { protectedHtml, widgets };
+}
+
+function restoreWidgets(html, widgets) {
+  let restored = html;
+  widgets.forEach((widget, i) => {
+    restored = restored.replace(`___WIDGET_${i}___`, widget);
+  });
+  return restored;
+}
+
+// ════════════════════════════════════════════
 // GET /api/webflow — blogs list OR single item
 // ════════════════════════════════════════════
 app.get('/api/webflow', async (req, res) => {
@@ -74,7 +98,6 @@ app.get('/api/webflow', async (req, res) => {
 
 // ════════════════════════════════════════════
 // PATCH /api/webflow — publish to Webflow
-// Sends HTML exactly as received from frontend
 // ════════════════════════════════════════════
 app.patch('/api/webflow', async (req, res) => {
   try {
@@ -101,6 +124,77 @@ app.patch('/api/webflow', async (req, res) => {
     console.log('Published:', itemId);
     res.json(data);
   } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ════════════════════════════════════════════
+// POST /api/upload-image — Upload to Webflow Assets
+// ════════════════════════════════════════════
+app.post('/api/upload-image', async (req, res) => {
+  try {
+    const { image, filename, siteId } = req.body;
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    
+    if (!token || !image || !filename) {
+      return res.status(400).json({ error: 'Missing required fields' });
+    }
+    
+    if (!siteId) {
+      return res.status(400).json({ 
+        error: 'Site ID required. Please reload blogs to get site ID.' 
+      });
+    }
+    
+    // Convert base64 to buffer
+    const matches = image.match(/^data:image\/(\w+);base64,(.+)$/);
+    if (!matches) {
+      return res.status(400).json({ error: 'Invalid image format' });
+    }
+    
+    const [, ext, base64Data] = matches;
+    const buffer = Buffer.from(base64Data, 'base64');
+    
+    // Create form data
+    const FormData = (await import('form-data')).default;
+    const form = new FormData();
+    
+    // Clean filename
+    const cleanFilename = filename.replace(/[^a-zA-Z0-9.-]/g, '_');
+    
+    form.append('file', buffer, {
+      filename: cleanFilename,
+      contentType: `image/${ext}`
+    });
+    
+    // Upload to Webflow Assets API
+    console.log(`Uploading ${cleanFilename} to Webflow site ${siteId}...`);
+    
+    const response = await fetch(`https://api.webflow.com/v2/sites/${siteId}/assets`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        ...form.getHeaders()
+      },
+      body: form
+    });
+    
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error('Webflow upload error:', errorText);
+      throw new Error(`Webflow upload failed: ${response.status}`);
+    }
+    
+    const data = await response.json();
+    console.log('Upload successful:', data.publicUrl || data.url);
+    
+    res.json({ 
+      url: data.publicUrl || data.url,
+      assetId: data.id 
+    });
+    
+  } catch (err) {
+    console.error('Image upload error:', err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -150,6 +244,11 @@ app.post('/api/smartcheck', async (req, res) => {
     const t0 = Date.now();
     let searchCount = 0;
 
+    // ── STEP 0: Protect widgets/embeds ──
+    console.log('=== Stage 0: Widget Protection ===');
+    const { protectedHtml: protectedContent, widgets } = protectWidgets(blogContent);
+    console.log(`  Protected ${widgets.length} widgets/embeds from Claude`);
+
     // ── 1. Generate search queries ──
     console.log('=== Stage 1: Query Gen ===');
     const qRes = await anthropic.messages.create({
@@ -158,7 +257,7 @@ app.post('/api/smartcheck', async (req, res) => {
       messages: [{ role: 'user', content: `Generate 6-8 search queries to fact-check: "${title}"
 
 BLOG EXCERPT:
-${blogContent.substring(0, 4000)}
+${protectedContent.substring(0, 4000)}
 
 Return ONLY a JSON array of strings. Focus on:
 - Official pricing pages (site:company.com pricing)
@@ -202,7 +301,7 @@ Include year 2025/2026 for latest info.` }]
     }
     console.log(`  ${unique.length} unique results from ${searchCount} searches`);
 
-    // ── 3. Claude rewrite ──
+    // ── 3. Claude rewrite (with protected content) ──
     console.log('=== Stage 3: Rewrite ===');
 
     const research = unique.map(r =>
@@ -231,7 +330,7 @@ GSC RULES:
 TITLE: ${title}
 
 CURRENT HTML:
-${blogContent}
+${protectedContent}
 
 RESEARCH:
 ${research}
@@ -245,25 +344,37 @@ ABSOLUTE RULES — violating any is a failure:
 5. PRESERVE every <strong>, <em>, <b>, <i> tag.
 6. PRESERVE every <a> with href, target, rel attributes.
 7. PRESERVE every <img> with src, alt, loading, width, height, class, style attributes.
-8. PRESERVE every <iframe>, <video>, <figure>, <figcaption>, <div>, embedded widget, script.
+8. PRESERVE every placeholder like ___WIDGET_0___, ___WIDGET_1___ etc. These are special markers that must remain unchanged.
 9. Fix outdated facts (pricing, features, stats) using research data.
 10. New lists MUST use: <ul role="list"><li role="listitem">text</li></ul>
 11. New bold = <strong>, new italic = <em>. Never markdown.
 12. Use active voice. Remove em-dashes. Use contractions where natural.
 13. NEVER strip attributes from any existing element.
-14. NEVER convert HTML to markdown.` }]
+14. NEVER convert HTML to markdown.
+15. DO NOT remove or modify any ___WIDGET_N___ markers - these are essential placeholders.` }]
     });
 
     let updated = rwRes.content[0].text;
     if (updated.startsWith('```')) updated = updated.replace(/^```(?:html)?\n?/, '').replace(/\n?```$/, '');
     updated = updated.trim();
 
+    // ── STEP 4: Restore widgets ──
+    console.log('=== Stage 4: Widget Restoration ===');
+    updated = restoreWidgets(updated, widgets);
+    console.log(`  Restored ${widgets.length} widgets/embeds to final HTML`);
+
     const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
     console.log(`Done in ${elapsed}s`);
 
     res.json({
       updatedContent: updated,
-      stats: { searches: searchCount, results: unique.length, elapsed, gscKeywords: gscKeywords?.length || 0 },
+      stats: { 
+        searches: searchCount, 
+        results: unique.length, 
+        elapsed, 
+        gscKeywords: gscKeywords?.length || 0,
+        widgetsProtected: widgets.length 
+      },
       research: unique.slice(0, 15)
     });
   } catch (err) {
