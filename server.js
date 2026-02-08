@@ -1,646 +1,285 @@
-import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import Anthropic from '@anthropic-ai/sdk';
+import dotenv from 'dotenv';
 
-// ============================================
-// GOOGLE CUSTOM SEARCH API
-// ============================================
-const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
-const GOOGLE_SEARCH_ENGINE_ID = process.env.GOOGLE_SEARCH_ENGINE_ID || '90a56bfbc96304c89';
-
-if (!GOOGLE_API_KEY) {
-  console.error('⚠️ WARNING: GOOGLE_API_KEY not found in environment variables!');
-}
-
+dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 
-const writingSystemPrompt = `You are an expert blog editor. You:
-1. Preserve ALL HTML structure, tags, classes, IDs exactly
-2. Preserve ALL heading levels (H1-H6) exactly - never change hierarchy
-3. Preserve ALL links with href, target, rel attributes exactly
-4. Preserve ALL images, iframes, embeds, widgets, scripts exactly
-5. Preserve ALL paragraph breaks, lists, tables exactly
-6. Fix factual errors based on research
-7. Remove em-dashes, shorten sentences, use contractions
-8. Use active voice
-9. Return ONLY HTML, no markdown`;
+// ════════════════════════════════════════════
+// BLOG CACHE (10 min TTL)
+// ════════════════════════════════════════════
+let blogCache = { data: null, timestamp: null, collectionId: null };
+const CACHE_TTL = 10 * 60 * 1000;
 
-// ============================================
-// BACKEND BLOG CACHE (Solves Concurrent User Issues)
-// ============================================
-let blogCache = {
-  data: null,
-  timestamp: null,
-  collectionId: null,
-  isRefreshing: false
-};
+function isCacheValid(cid) {
+  return blogCache.data && blogCache.collectionId === cid &&
+    blogCache.timestamp && (Date.now() - blogCache.timestamp < CACHE_TTL);
+}
 
-const CACHE_DURATION = 10 * 60 * 1000; // 10 minutes
-
-// Fetch all blogs from Webflow
-async function fetchAllBlogsFromWebflow(collectionId, webflowToken) {
-  console.log('📥 Fetching all blogs from Webflow...');
-  const startTime = Date.now();
-  
-  const allItems = [];
-  const limit = 100;
+async function fetchAllBlogs(collectionId, token) {
+  console.log('Fetching blogs from Webflow...');
+  const items = [];
   let offset = 0;
-  let hasMore = true;
-
-  while (hasMore) {
-    const url = `https://api.webflow.com/v2/collections/${collectionId}/items?limit=${limit}&offset=${offset}`;
-    
-    const response = await fetch(url, {
-      headers: {
-        'Authorization': `Bearer ${webflowToken}`,
-        'accept': 'application/json'
-      }
+  while (true) {
+    const url = `https://api.webflow.com/v2/collections/${collectionId}/items?limit=100&offset=${offset}`;
+    const res = await fetch(url, {
+      headers: { 'Authorization': `Bearer ${token}`, 'accept': 'application/json' }
     });
-
-    if (!response.ok) {
-      throw new Error(`Webflow API error: ${response.status}`);
-    }
-
-    const data = await response.json();
-    const items = data.items || [];
-
-    console.log(`  Batch: offset=${offset}, received=${items.length} items`);
-
-    allItems.push(...items);
-
-    if (items.length < limit) {
-      hasMore = false;
-    } else {
-      offset += limit;
-      await new Promise(resolve => setTimeout(resolve, 300));
-    }
+    if (!res.ok) throw new Error(`Webflow ${res.status}`);
+    const data = await res.json();
+    const batch = data.items || [];
+    items.push(...batch);
+    if (batch.length < 100) break;
+    offset += 100;
+    await new Promise(r => setTimeout(r, 200));
   }
-
-  // DEDUPLICATE by ID
-  const uniqueItems = [];
-  const seenIds = new Set();
-  
-  for (const item of allItems) {
-    if (!seenIds.has(item.id)) {
-      seenIds.add(item.id);
-      uniqueItems.push(item);
-    }
-  }
-
-  const duplicatesRemoved = allItems.length - uniqueItems.length;
-  
-  const duration = ((Date.now() - startTime) / 1000).toFixed(1);
-  console.log(`✅ Fetched ${allItems.length} blogs from Webflow in ${duration}s`);
-  if (duplicatesRemoved > 0) {
-    console.log(`⚠️ Removed ${duplicatesRemoved} duplicates → ${uniqueItems.length} unique blogs`);
-  } else {
-    console.log(`✓ All ${uniqueItems.length} blogs are unique (no duplicates)`);
-  }
-
-  return { items: uniqueItems };
+  const seen = new Set();
+  return items.filter(i => { if (seen.has(i.id)) return false; seen.add(i.id); return true; });
 }
 
-// Check if cache is valid
-function isCacheValid(collectionId) {
-  if (!blogCache.data) return false;
-  if (blogCache.collectionId !== collectionId) return false;
-  if (!blogCache.timestamp) return false;
-  
-  const age = Date.now() - blogCache.timestamp;
-  return age < CACHE_DURATION;
-}
-
-// ============================================
-// CACHED WEBFLOW API PROXY
-// ============================================
+// ════════════════════════════════════════════
+// GET /api/webflow — blogs list OR single item
+// ════════════════════════════════════════════
 app.get('/api/webflow', async (req, res) => {
   try {
-    const { collectionId, itemId, limit, offset } = req.query;
-    const webflowToken = req.headers.authorization?.replace('Bearer ', '');
+    const { collectionId, itemId } = req.query;
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    if (!token || !collectionId) return res.status(400).json({ error: 'Missing credentials' });
 
-    if (!webflowToken || !collectionId) {
-      return res.status(400).json({ error: 'Missing Webflow token or collection ID' });
-    }
-
-    // Single item fetch (not cached)
+    // Single blog fetch
     if (itemId) {
-      console.log(`📄 Fetching single item: ${itemId}`);
-      const url = `https://api.webflow.com/v2/collections/${collectionId}/items/${itemId}`;
-      
-      const response = await fetch(url, {
-        headers: {
-          'Authorization': `Bearer ${webflowToken}`,
-          'accept': 'application/json'
-        }
+      const r = await fetch(`https://api.webflow.com/v2/collections/${collectionId}/items/${itemId}`, {
+        headers: { 'Authorization': `Bearer ${token}`, 'accept': 'application/json' }
       });
-
-      const data = await response.json();
-      
-      if (!response.ok) {
-        return res.status(response.status).json(data);
-      }
-
-      return res.json(data);
+      const d = await r.json();
+      return r.ok ? res.json(d) : res.status(r.status).json(d);
     }
 
-    // List fetch - USE CACHE
-    console.log('📋 Blog list request received');
-
-    // Check if cache is valid
+    // All blogs (cached)
     if (isCacheValid(collectionId)) {
-      const cacheAge = Math.round((Date.now() - blogCache.timestamp) / 1000);
-      console.log(`✅ Cache HIT! Serving ${blogCache.data.items.length} blogs (age: ${cacheAge}s)`);
-      
-      res.set('X-Cache', 'HIT');
-      res.set('X-Cache-Age', cacheAge.toString());
-      
-      return res.json(blogCache.data);
+      return res.json({ items: blogCache.data, cached: true });
     }
-
-    // Cache miss or expired - fetch fresh data
-    const cacheStatus = !blogCache.data ? 'EMPTY' : 'EXPIRED';
-    console.log(`❌ Cache ${cacheStatus} - fetching from Webflow...`);
-
-    // Prevent multiple concurrent fetches
-    if (blogCache.isRefreshing) {
-      console.log('⏳ Waiting for ongoing refresh...');
-      const maxWait = 180000; // 3 minutes
-      const waitStart = Date.now();
-      
-      while (blogCache.isRefreshing && (Date.now() - waitStart) < maxWait) {
-        await new Promise(resolve => setTimeout(resolve, 1000));
-      }
-      
-      if (isCacheValid(collectionId)) {
-        console.log('✅ Cache populated by concurrent request');
-        res.set('X-Cache', 'WAIT-HIT');
-        return res.json(blogCache.data);
-      }
-    }
-
-    blogCache.isRefreshing = true;
-
-    try {
-      const freshData = await fetchAllBlogsFromWebflow(collectionId, webflowToken);
-      
-      blogCache.data = freshData;
-      blogCache.timestamp = Date.now();
-      blogCache.collectionId = collectionId;
-      
-      res.set('X-Cache', 'MISS');
-      res.set('X-Cache-Age', '0');
-      
-      res.json(freshData);
-    } finally {
-      blogCache.isRefreshing = false;
-    }
-
-  } catch (error) {
-    console.error('Webflow API error:', error);
-    blogCache.isRefreshing = false;
-    res.status(500).json({ error: error.message });
+    const items = await fetchAllBlogs(collectionId, token);
+    blogCache = { data: items, timestamp: Date.now(), collectionId };
+    res.json({ items, cached: false });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
-// Cache status endpoint
-app.get('/api/cache-status', (req, res) => {
-  const cacheAge = blogCache.timestamp ? Math.round((Date.now() - blogCache.timestamp) / 1000) : null;
-  const isValid = isCacheValid(blogCache.collectionId);
-  
-  res.json({
-    hasCachedData: !!blogCache.data,
-    itemCount: blogCache.data?.items?.length || 0,
-    cacheAgeSeconds: cacheAge,
-    isValid: isValid,
-    collectionId: blogCache.collectionId,
-    isRefreshing: blogCache.isRefreshing,
-    cacheDurationSeconds: CACHE_DURATION / 1000
-  });
-});
-
-// Force cache clear
-app.post('/api/cache-clear', (req, res) => {
-  console.log('🗑️ Cache manually cleared');
-  blogCache.data = null;
-  blogCache.timestamp = null;
-  blogCache.collectionId = null;
-  res.json({ success: true, message: 'Cache cleared' });
-});
-
-// ============================================
-// WEBFLOW UPDATE
-// ============================================
+// ════════════════════════════════════════════
+// PATCH /api/webflow — publish to Webflow
+// Sends HTML exactly as received from frontend
+// ════════════════════════════════════════════
 app.patch('/api/webflow', async (req, res) => {
   try {
     const { collectionId, itemId } = req.query;
-    const webflowToken = req.headers.authorization?.replace('Bearer ', '');
+    const token = req.headers.authorization?.replace('Bearer ', '');
     const { fieldData } = req.body;
-
-    if (!webflowToken || !collectionId || !itemId || !fieldData) {
-      return res.status(400).json({ error: 'Missing required fields' });
-    }
-
-    console.log(`📝 Updating item ${itemId}...`);
+    if (!token || !collectionId || !itemId || !fieldData) return res.status(400).json({ error: 'Missing fields' });
 
     const url = `https://api.webflow.com/v2/collections/${collectionId}/items/${itemId}`;
-    
     const response = await fetch(url, {
       method: 'PATCH',
       headers: {
-        'Authorization': `Bearer ${webflowToken}`,
+        'Authorization': `Bearer ${token}`,
         'Content-Type': 'application/json',
         'accept': 'application/json'
       },
       body: JSON.stringify({ fieldData })
     });
-
     const data = await response.json();
-    
-    if (!response.ok) {
-      console.error('Webflow PATCH error:', data);
-      return res.status(response.status).json(data);
-    }
+    if (!response.ok) return res.status(response.status).json(data);
 
-    console.log('✅ Item updated successfully');
-    
-    // Invalidate cache after update
-    if (blogCache.collectionId === collectionId) {
-      console.log('🔄 Cache invalidated due to item update');
-      blogCache.timestamp = 0;
-    }
-
+    // Invalidate cache
+    if (blogCache.collectionId === collectionId) blogCache.timestamp = 0;
+    console.log('Published:', itemId);
     res.json(data);
-  } catch (error) {
-    console.error('Webflow update error:', error);
-    res.status(500).json({ error: error.message });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
-// ============================================
-// SMART ANALYSIS ENDPOINT (WITH GSC SUPPORT)
-// ============================================
-app.post('/api/analyze', async (req, res) => {
+// ════════════════════════════════════════════
+// BRAVE SEARCH
+// ════════════════════════════════════════════
+async function braveSearch(query, key, count = 5) {
+  if (!key) return [];
   try {
-    const { 
-      blogContent, 
-      title, 
-      anthropicKey, 
-      braveKey,
-      researchPrompt,
-      writingPrompt,
-      gscKeywords,      // 🆕 GSC keywords array
-      gscPosition       // 🆕 Current GSC position
+    const url = `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(query)}&count=${count}`;
+    const res = await fetch(url, { headers: { 'X-Subscription-Token': key, 'Accept': 'application/json' } });
+    if (!res.ok) return [];
+    const data = await res.json();
+    return (data.web?.results || []).map(r => ({ title: r.title, url: r.url, snippet: r.description || '', source: 'brave' }));
+  } catch { return []; }
+}
+
+// ════════════════════════════════════════════
+// GOOGLE CUSTOM SEARCH
+// ════════════════════════════════════════════
+async function googleSearch(query, key, cx, count = 5) {
+  if (!key || !cx) return [];
+  try {
+    const url = `https://www.googleapis.com/customsearch/v1?key=${key}&cx=${cx}&q=${encodeURIComponent(query)}&num=${count}`;
+    const res = await fetch(url);
+    if (!res.ok) return [];
+    const data = await res.json();
+    return (data.items || []).map(r => ({ title: r.title, url: r.link, snippet: r.snippet || '', source: 'google' }));
+  } catch { return []; }
+}
+
+// ════════════════════════════════════════════
+// POST /api/smartcheck — Research + Rewrite
+// ════════════════════════════════════════════
+app.post('/api/smartcheck', async (req, res) => {
+  try {
+    const {
+      blogContent, title, slug,
+      anthropicKey, braveKey, googleKey, googleCx,
+      gscKeywords
     } = req.body;
 
-    if (!blogContent || !anthropicKey) {
-      return res.status(400).json({ error: 'Missing required fields' });
-    }
+    if (!blogContent || !anthropicKey) return res.status(400).json({ error: 'Missing required fields' });
 
     const anthropic = new Anthropic({ apiKey: anthropicKey });
-    
-    let totalSearchesUsed = 0;
-    let totalClaudeCalls = 0;
-    let allChanges = [];
+    const t0 = Date.now();
+    let searchCount = 0;
 
-    const startTime = Date.now();
-
-    // 🆕 GSC MODE DETECTION
-    const isGscMode = gscKeywords && Array.isArray(gscKeywords) && gscKeywords.length > 0;
-    
-    if (isGscMode) {
-      console.log(`\n🎯 GSC MODE: Optimizing with ${gscKeywords.length} keywords + web search`);
-      console.log(`   Keywords: ${gscKeywords.slice(0, 5).join(', ')}${gscKeywords.length > 5 ? '...' : ''}`);
-      if (gscPosition) {
-        console.log(`   Current position: ${gscPosition.toFixed(1)}`);
-      }
-    }
-
-    // ============================================
-    // STAGE 1: QUERY GENERATION (ALWAYS RUN)
-    // ============================================
-    console.log('=== STAGE 1: QUERY GENERATION ===');
-      
-    console.log('=== STAGE 1: QUERY GENERATION ===');
-    
-    const queryPrompt = `Generate 6-8 search queries to fact-check this blog: "${title}"
+    // ── 1. Generate search queries ──
+    console.log('=== Stage 1: Query Gen ===');
+    const qRes = await anthropic.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 2000,
+      messages: [{ role: 'user', content: `Generate 6-8 search queries to fact-check: "${title}"
 
 BLOG EXCERPT:
-${blogContent.substring(0, 3000)}
+${blogContent.substring(0, 4000)}
 
-RULES:
-1. Use "site:companyname.com" for official sources
-2. Search for "new features 2025", "ai features 2025"
-3. Target specific products/tools mentioned
-4. DO NOT generate pricing queries (manual verification)
-5. Include year "2025" for latest info
-
-🤖 SPECIAL: If SalesRobot mentioned, ALWAYS include:
-- "site:salesrobot.co ai features 2025"
-- "salesrobot ai capabilities 2025"
-- "salesrobot ai message optimization"
-
-GOOD: "site:mailshake.com features 2025", "mailshake ai features 2025"
-BAD: "mailshake pricing", "best email tools"
-
-Return JSON array: ["query1", "query2", ...]`;
-
-    const queryResponse = await anthropic.messages.create({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 1000,
-      messages: [{ role: 'user', content: queryPrompt }]
+Return ONLY a JSON array of strings. Focus on:
+- Official pricing pages (site:company.com pricing)
+- Product feature updates (product 2025 features)
+- Stats and claims verification
+- Competitor info mentioned
+Include year 2025/2026 for latest info.` }]
     });
 
-    totalClaudeCalls++;
-
-    let searchQueries = [];
+    let queries = [];
     try {
-      const queryText = queryResponse.content[0].text.trim()
-        .replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
-      searchQueries = JSON.parse(queryText);
-      console.log('✓ Generated queries:');
-      searchQueries.forEach((q, i) => {
-        const isPricing = q.toLowerCase().includes('pric');
-        console.log(`  ${i + 1}. ${q} ${isPricing ? '⚠️ PRICING' : '✓'}`);
-      });
-    } catch (e) {
-      console.error('Query parse failed:', e);
-      searchQueries = [];
+      const raw = qRes.content[0].text.replace(/```json\n?|```\n?/g, '').trim();
+      queries = JSON.parse(raw);
+    } catch {
+      const m = qRes.content[0].text.match(/\[[\s\S]*?\]/);
+      queries = m ? JSON.parse(m[0]) : [];
+    }
+    console.log(`  ${queries.length} queries generated`);
+
+    // ── 2. Run Brave + Google searches ──
+    console.log('=== Stage 2: Search ===');
+    let allResults = [];
+
+    for (const q of queries.slice(0, 8)) {
+      const [b, g] = await Promise.all([
+        braveSearch(q, braveKey, 3),
+        googleSearch(q, googleKey, googleCx, 3)
+      ]);
+      searchCount++;
+      allResults.push({ query: q, results: [...b, ...g] });
+      await new Promise(r => setTimeout(r, 150));
     }
 
-    if (searchQueries.length === 0) {
-      return res.status(400).json({ error: 'Failed to generate queries' });
-    }
-
-    // ============================================
-    // STAGE 2: HYBRID SEARCH (ALWAYS RUN)
-    // ============================================
-    console.log('\n=== STAGE 2: HYBRID SEARCH ===');
-      
-    console.log('\n=== STAGE 2: HYBRID SEARCH ===');
-    
-    // Separate queries by type
-    const pricingQueries = [];
-    const featureQueries = [];
-    
-    searchQueries.slice(0, 8).forEach(q => {
-      const isPricing = q.toLowerCase().includes('pric') || 
-                       q.toLowerCase().includes('cost') ||
-                       q.toLowerCase().includes('plan');
-      if (isPricing) {
-        pricingQueries.push(q);
-      } else {
-        featureQueries.push(q);
+    // Dedupe
+    const seen = new Set();
+    const unique = [];
+    for (const grp of allResults) {
+      for (const r of grp.results) {
+        if (!seen.has(r.url)) { seen.add(r.url); unique.push({ ...r, query: grp.query }); }
       }
+    }
+    console.log(`  ${unique.length} unique results from ${searchCount} searches`);
+
+    // ── 3. Claude rewrite ──
+    console.log('=== Stage 3: Rewrite ===');
+
+    const research = unique.map(r =>
+      `[${r.source?.toUpperCase()}] ${r.title}\nURL: ${r.url}\n${r.snippet}`
+    ).join('\n\n');
+
+    let gscBlock = '';
+    if (gscKeywords?.length > 0) {
+      gscBlock = `
+
+GSC KEYWORDS TO INTEGRATE:
+${gscKeywords.map(k => `- "${k.keyword}" (Pos ${k.position}, ${k.clicks} clicks)`).join('\n')}
+
+GSC RULES:
+- Work keywords into EXISTING H2/H3 headings where natural — change heading text to include the keyword
+- Add a short paragraph for keywords with no existing coverage
+- For question keywords (who/what/how/why/is/can/does), add an FAQ at bottom: <h2>Frequently Asked Questions</h2> with <h3>question</h3><p>answer</p> pairs
+- Do NOT keyword-stuff — text must read naturally`;
+    }
+
+    const rwRes = await anthropic.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 16000,
+      messages: [{ role: 'user', content: `You are an expert blog content updater. Rewrite this blog using the research below.
+
+TITLE: ${title}
+
+CURRENT HTML:
+${blogContent}
+
+RESEARCH:
+${research}
+${gscBlock}
+
+ABSOLUTE RULES — violating any is a failure:
+1. Return ONLY the updated HTML. No markdown fences. No explanation.
+2. PRESERVE every HTML tag, class, id, data attribute EXACTLY as-is unless fixing a fact.
+3. PRESERVE all heading levels (h1-h6). Only change heading TEXT for GSC keywords or factual fixes.
+4. PRESERVE every <ul>, <ol>, <li> with ALL attributes (role, class, style, etc).
+5. PRESERVE every <strong>, <em>, <b>, <i> tag.
+6. PRESERVE every <a> with href, target, rel attributes.
+7. PRESERVE every <img> with src, alt, loading, width, height, class, style attributes.
+8. PRESERVE every <iframe>, <video>, <figure>, <figcaption>, <div>, embedded widget, script.
+9. Fix outdated facts (pricing, features, stats) using research data.
+10. New lists MUST use: <ul role="list"><li role="listitem">text</li></ul>
+11. New bold = <strong>, new italic = <em>. Never markdown.
+12. Use active voice. Remove em-dashes. Use contractions where natural.
+13. NEVER strip attributes from any existing element.
+14. NEVER convert HTML to markdown.` }]
     });
-    
-    console.log(`Distribution: ${featureQueries.length} Brave + ${pricingQueries.length} Google`);
-    
-    let findings = `# RESEARCH FINDINGS\n\n`;
 
-    // PART A: BRAVE SEARCH (Features)
-      if (featureQueries.length > 0 && braveKey) {
-        console.log('\n--- BRAVE SEARCH (Features) ---');
-        
-        for (const query of featureQueries) {
-          try {
-            console.log(`Brave ${totalSearchesUsed + 1}: ${query}`);
-            
-            const braveResponse = await fetch(
-              `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(query)}&count=5`,
-              {
-                headers: {
-                  'Accept': 'application/json',
-                  'X-Subscription-Token': braveKey
-                }
-              }
-            );
+    let updated = rwRes.content[0].text;
+    if (updated.startsWith('```')) updated = updated.replace(/^```(?:html)?\n?/, '').replace(/\n?```$/, '');
+    updated = updated.trim();
 
-            if (braveResponse.ok) {
-              const braveData = await braveResponse.json();
-              totalSearchesUsed++;
-              
-              findings += `## "${query}" [BRAVE]\n`;
-              
-              if (braveData.web?.results) {
-                braveData.web.results.slice(0, 3).forEach((r, i) => {
-                  findings += `${i + 1}. **${r.title}**\n   ${r.url}\n   ${r.description || ''}\n\n`;
-                  console.log(`  ${i + 1}. ${r.title.substring(0, 60)}...`);
-                });
-              }
-              findings += '\n';
-            } else {
-              console.error(`Brave error: ${braveResponse.status}`);
-            }
-            
-            await new Promise(r => setTimeout(r, 400));
-            
-          } catch (error) {
-            console.error(`Brave failed: ${error.message}`);
-          }
-        }
-      }
-
-      // PART B: GOOGLE SEARCH (Pricing)
-      if (pricingQueries.length > 0 && GOOGLE_API_KEY) {
-        console.log('\n--- GOOGLE SEARCH (Pricing) ---');
-        
-        for (const query of pricingQueries) {
-          try {
-            console.log(`Google ${totalSearchesUsed + 1}: ${query}`);
-            
-            const googleResponse = await fetch(
-              `https://www.googleapis.com/customsearch/v1?key=${GOOGLE_API_KEY}&cx=${GOOGLE_SEARCH_ENGINE_ID}&q=${encodeURIComponent(query)}&num=5`,
-              { headers: { 'Accept': 'application/json' } }
-            );
-
-            if (googleResponse.ok) {
-              const googleData = await googleResponse.json();
-              totalSearchesUsed++;
-              
-              findings += `## "${query}" [GOOGLE-PRICING]\n`;
-              
-              if (googleData.items) {
-                googleData.items.slice(0, 3).forEach((r, i) => {
-                  findings += `${i + 1}. **${r.title}**\n   ${r.link}\n   ${r.snippet || ''}\n\n`;
-                  console.log(`  ${i + 1}. ${r.title.substring(0, 60)}...`);
-                });
-              }
-              findings += '\n';
-            } else {
-              const err = await googleResponse.json();
-              console.error(`Google error: ${err.error?.message || googleResponse.status}`);
-            }
-            
-            await new Promise(r => setTimeout(r, 200));
-            
-          } catch (error) {
-            console.error(`Google failed: ${error.message}`);
-          }
-        }
-      }
-
-      console.log(`\n✓ Search complete: ${totalSearchesUsed} total`);
-
-    // ============================================
-    // STAGE 3: CONTENT REWRITING (WITH GSC + SEARCH)
-    // ============================================
-    console.log('\n=== STAGE 3: CONTENT REWRITING ===');
-
-    const MAX_CHUNK = 15000;
-    let chunks = [];
-    
-    if (blogContent.length > MAX_CHUNK) {
-      console.log(`Chunking ${blogContent.length} chars...`);
-      const sections = blogContent.split(/(<h[1-6][^>]*>.*?<\/h[1-6]>)/gi);
-      let current = '';
-      
-      for (const section of sections) {
-        if (current.length + section.length > MAX_CHUNK && current.length > 0) {
-          chunks.push(current);
-          current = section;
-        } else {
-          current += section;
-        }
-      }
-      
-      if (current) chunks.push(current);
-      console.log(`Split into ${chunks.length} chunks`);
-    } else {
-      chunks = [blogContent];
-    }
-
-    let finalContent = '';
-    
-    for (let i = 0; i < chunks.length; i++) {
-      const chunk = chunks[i];
-      
-      console.log(`Processing chunk ${i + 1}/${chunks.length}...`);
-
-      // 🆕 BUILD REWRITE PROMPT (ALWAYS USE SEARCH FINDINGS + GSC IF AVAILABLE)
-      let rewritePrompt = '';
-      
-      if (isGscMode) {
-        // 🆕 GSC + SEARCH MODE: Use both!
-        const questionWords = ['how', 'what', 'why', 'when', 'where', 'is', 'are', 'can', 'does', 'do'];
-        const questionKeywords = gscKeywords.filter(k => 
-          questionWords.some(q => k.toLowerCase().startsWith(q + ' ') || k.toLowerCase().startsWith(q + "'"))
-        );
-        
-        const hasQuestions = questionKeywords.length > 0;
-        
-        rewritePrompt = `Optimize this content using BOTH search findings AND GSC keywords.
-
-📚 SEARCH FINDINGS:
-${findings}
-
-🎯 TARGET KEYWORDS (Top ${gscKeywords.length}):
-${gscKeywords.map((k, i) => `${i + 1}. ${k}`).join('\n')}
-
-${gscPosition ? `📊 Current position: ${gscPosition.toFixed(1)} (improve this!)` : ''}
-
-CONTENT:
-${chunk}
-
-✅ OPTIMIZATION RULES:
-1. Fix factual errors using search findings
-2. Add NEW features from official sources (search results)
-3. Naturally integrate ALL ${gscKeywords.length} GSC keywords
-4. Target keyword density: 1-2% (not forced)
-5. Use keywords in subheadings where natural
-6. Keep ALL HTML structure exact (headings, lists, links, images)
-
-${hasQuestions ? `
-🤔 FAQ SECTION (MANDATORY):
-You detected ${questionKeywords.length} question keyword(s):
-${questionKeywords.map((k, i) => `${i + 1}. ${k}`).join('\n')}
-
-Add FAQ section at the end:
-<h3>Frequently Asked Questions</h3>
-
-For EACH question keyword, create:
-<h4>Question based on keyword?</h4>
-<p>Comprehensive answer (2-3 sentences)</p>
-` : ''}
-
-⚠️ NEVER update pricing (manual verification only)
-✅ Preserve ALL HTML structure exactly
-
-Return ONLY rewritten HTML${hasQuestions ? ' with FAQ section at the end' : ''}, no explanations.`;
-
-      } else {
-        // NORMAL MODE: Just search findings
-        rewritePrompt = `Rewrite based on search findings.
-
-SEARCH RESULTS:
-${findings}
-
-CONTENT:
-${chunk}
-
-RULES:
-⚠️ NEVER update pricing (manual verification only)
-✅ Add NEW features from official sources
-✅ Add AI features if found
-✅ Update stats from authoritative sources
-✅ Preserve ALL HTML structure exactly
-✅ Keep heading levels exact (H1-H6)
-✅ Keep all links, images, widgets exact
-
-🤖 SALESROBOT: If mentioned, ADD AI features found:
-- AI message optimization
-- AI subject lines
-- AI personalization
-- Smart automation
-Add naturally with "Additionally," or "Moreover,"
-
-Return ONLY rewritten HTML, no explanations.`;
-      }
-
-      const rewriteResponse = await anthropic.messages.create({
-        model: 'claude-sonnet-4-20250514',
-        max_tokens: 16000,
-        system: writingSystemPrompt,
-        messages: [{ role: 'user', content: rewritePrompt }]
-      });
-
-      totalClaudeCalls++;
-      finalContent += rewriteResponse.content[0].text.trim();
-      
-      console.log(`✓ Chunk ${i + 1} complete`);
-    }
-
-    const duration = ((Date.now() - startTime) / 1000).toFixed(1);
-    
-    console.log(`\n✅ COMPLETE: ${duration}s | ${totalSearchesUsed} searches | ${totalClaudeCalls} Claude calls`);
-    if (isGscMode) {
-      console.log(`   GSC: Optimized with ${gscKeywords.length} keywords`);
-    }
-    console.log('');
+    const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+    console.log(`Done in ${elapsed}s`);
 
     res.json({
-      content: finalContent,
-      changes: allChanges,
-      searchesUsed: totalSearchesUsed,
-      claudeCalls: totalClaudeCalls,
-      sectionsUpdated: chunks.length,
-      duration: parseFloat(duration),
-      gscOptimized: isGscMode  // 🆕 Flag indicating GSC optimization
+      updatedContent: updated,
+      stats: { searches: searchCount, results: unique.length, elapsed, gscKeywords: gscKeywords?.length || 0 },
+      research: unique.slice(0, 15)
     });
-
-  } catch (error) {
-    console.error('Analysis error:', error);
-    res.status(500).json({ error: error.message });
+  } catch (err) {
+    console.error('Smart check error:', err);
+    res.status(500).json({ error: err.message });
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`🚀 ContentOps backend: port ${PORT}`);
-  console.log(`🔍 Google Search: ${GOOGLE_API_KEY ? '✓' : '✗ (pricing skipped)'}`);
-  console.log(`💾 Blog cache: Enabled (${CACHE_DURATION / 1000}s TTL)`);
-  console.log(`🎯 GSC keyword optimization: Enabled`);
+// ════════════════════════════════════════════
+// HEALTH
+// ════════════════════════════════════════════
+app.get('/api/health', (req, res) => {
+  res.json({
+    status: 'ok',
+    cache: blogCache.data ? { count: blogCache.data.length, ageSeconds: Math.round((Date.now() - (blogCache.timestamp || 0)) / 1000) } : null
+  });
 });
+
+app.listen(PORT, () => console.log(`Server on port ${PORT}`));
