@@ -216,7 +216,8 @@ app.get('/api/webflow', async (req, res) => {
     const cached = getFromCache(blogCache, cacheKey, BLOG_CACHE_TTL);
     if (cached) {
       console.log(`Serving ${cached.length} blogs from cache`);
-      return res.json({ items: cached, cached: true });
+      const siteId = cached.length > 0 ? cached[0].siteId : null;
+      return res.json({ items: cached, cached: true, siteId });
     }
 
     // Fetch all blogs
@@ -224,7 +225,11 @@ app.get('/api/webflow', async (req, res) => {
     setCache(blogCache, cacheKey, items);
     
     console.log(`Fetched and cached ${items.length} blogs`);
-    res.json({ items, cached: false });
+    
+    // Extract siteId from first item (if available)
+    const siteId = items.length > 0 ? items[0].siteId : null;
+    
+    res.json({ items, cached: false, siteId });
     
   } catch (err) {
     console.error('Webflow fetch error:', err);
@@ -307,11 +312,22 @@ app.post('/api/upload-image', async (req, res) => {
     const { image, filename, siteId } = req.body;
     const token = req.headers.authorization?.replace('Bearer ', '');
     
+    console.log('📸 Image upload request:', {
+      hasToken: !!token,
+      hasImage: !!image,
+      hasFilename: !!filename,
+      hasSiteId: !!siteId,
+      filename,
+      siteId
+    });
+    
     if (!token || !image || !filename) {
+      console.error('❌ Missing required fields:', { token: !!token, image: !!image, filename: !!filename });
       return res.status(400).json({ error: 'Missing required fields' });
     }
     
     if (!siteId) {
+      console.error('❌ Missing siteId');
       return res.status(400).json({ 
         error: 'Site ID required. Please reload blogs to get site ID.' 
       });
@@ -702,6 +718,16 @@ app.get('/api/health', (req, res) => {
     rateLimits: {
       activeIPs: rateLimitMap.size
     }
+  });
+});
+
+// Debug endpoint for troubleshooting
+app.get('/api/debug', (req, res) => {
+  const blogData = Array.from(blogCache.values())[0];
+  res.json({
+    hasBlogCache: blogCache.size > 0,
+    sampleBlogHasSiteId: blogData?.data?.[0]?.siteId ? true : false,
+    sampleSiteId: blogData?.data?.[0]?.siteId || 'not found'
   });
 });
 
