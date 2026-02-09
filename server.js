@@ -255,18 +255,21 @@ app.patch('/api/webflow', async (req, res) => {
   }
 });
 
-// ════════════════════════════════════════════
-// POST /api/upload-image
-// ════════════════════════════════════════════
+// ============================================
+// IMAGE UPLOAD TO WEBFLOW
+// Add this AFTER the app.patch('/api/webflow') block
+// and BEFORE the app.post('/api/analyze') block
+// ============================================
 app.post('/api/upload-image', async (req, res) => {
   try {
-    const ip = req.ip || req.connection?.remoteAddress;
-    if (!rateOk(ip)) return res.status(429).json({ error: 'Too many uploads.' });
-
     const { image, filename, siteId } = req.body;
-    const token = req.headers.authorization?.replace('Bearer ', '');
-    if (!token || !image || !filename || !siteId) return res.status(400).json({ error: 'Missing fields (need image, filename, siteId)' });
+    const webflowToken = req.headers.authorization?.replace('Bearer ', '');
 
+    if (!webflowToken || !image || !filename || !siteId) {
+      return res.status(400).json({ error: 'Missing fields (need image, filename, siteId)' });
+    }
+
+    // Parse base64 image
     const matches = image.match(/^data:image\/(\w+);base64,(.+)$/);
     if (!matches) return res.status(400).json({ error: 'Invalid image format' });
 
@@ -274,25 +277,40 @@ app.post('/api/upload-image', async (req, res) => {
     const buf = Buffer.from(b64, 'base64');
     if (buf.length > 5 * 1024 * 1024) return res.status(400).json({ error: 'Max 5MB' });
 
+    // Build multipart form
     const FormData = (await import('form-data')).default;
     const form = new FormData();
-    form.append('file', buf, { filename: filename.replace(/[^a-zA-Z0-9.-]/g, '_'), contentType: `image/${ext}` });
+    form.append('file', buf, {
+      filename: filename.replace(/[^a-zA-Z0-9.-]/g, '_'),
+      contentType: `image/${ext}`
+    });
 
-    console.log(`Uploading ${filename} (${(buf.length / 1024).toFixed(0)}KB)...`);
-    const r = await fetchR(
-      `https://api.webflow.com/v2/sites/${siteId}/assets`,
-      { method: 'POST', headers: { 'Authorization': `Bearer ${token}`, ...form.getHeaders() }, body: form },
-      45000, 2
-    );
-    if (!r.ok) throw new Error(`Upload failed: ${r.status}`);
-    const d = await r.json();
-    res.json({ url: d.publicUrl || d.url, assetId: d.id });
-  } catch (err) {
-    console.error('Upload error:', err.message);
-    res.status(500).json({ error: err.message });
+    console.log(`📤 Uploading ${filename} (${(buf.length / 1024).toFixed(0)}KB) to Webflow...`);
+
+    const response = await fetch(`https://api.webflow.com/v2/sites/${siteId}/assets`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${webflowToken}`,
+        ...form.getHeaders()
+      },
+      body: form
+    });
+
+    if (!response.ok) {
+      const errBody = await response.text();
+      console.error('Webflow upload error:', errBody);
+      throw new Error(`Upload failed: ${response.status}`);
+    }
+
+    const data = await response.json();
+    console.log('✅ Image uploaded:', data.publicUrl || data.url);
+
+    res.json({ url: data.publicUrl || data.url, assetId: data.id });
+  } catch (error) {
+    console.error('Upload error:', error.message);
+    res.status(500).json({ error: error.message });
   }
 });
-
 // ════════════════════════════════════════════
 // SEARCH (cached)
 // ════════════════════════════════════════════
