@@ -197,7 +197,24 @@ app.get('/api/webflow', async (req, res) => {
     // All blogs (with dedup)
     const items = await fetchAllBlogs(collectionId, token);
     const fromCache = !!cacheGet(blogCache, collectionId, BLOG_CACHE_TTL);
-    res.json({ items, cached: fromCache });
+
+    // Auto-detect siteId from collection info (needed for image uploads)
+    let siteId = null;
+    try {
+      const colRes = await fetchR(
+        `https://api.webflow.com/v2/collections/${collectionId}`,
+        { headers: { 'Authorization': `Bearer ${token}`, 'accept': 'application/json' } },
+        10000, 1
+      );
+      if (colRes.ok) {
+        const colData = await colRes.json();
+        siteId = colData.siteId || null;
+      }
+    } catch (e) {
+      console.warn('Could not fetch siteId:', e.message);
+    }
+
+    res.json({ items, cached: fromCache, siteId });
 
   } catch (err) {
     console.error('Webflow fetch error:', err.message);
