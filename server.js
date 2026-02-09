@@ -7,376 +7,519 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Google Search from env (server-side, not client-sent)
-const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY || '';
-const GOOGLE_CX = process.env.GOOGLE_SEARCH_ENGINE_ID || '';
-
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 
 // ════════════════════════════════════════════
-// MULTI-LAYER CACHE
+// MULTI-LAYER CACHE SYSTEM
 // ════════════════════════════════════════════
-const blogCache = new Map();       // collectionId → { data, timestamp }
-const BLOG_CACHE_TTL = 10 * 60 * 1000;
+const blogCache = new Map(); // Key: collectionId, Value: { data, timestamp }
+const BLOG_CACHE_TTL = 10 * 60 * 1000; // 10 minutes
 
-const searchCache = new Map();     // queryHash → { data, timestamp }
-const SEARCH_CACHE_TTL = 60 * 60 * 1000;
+const searchResultsCache = new Map(); // Key: query hash, Value: { results, timestamp }
+const SEARCH_CACHE_TTL = 60 * 60 * 1000; // 1 hour
 
-const analysisCache = new Map();   // contentHash → { data, timestamp }
-const ANALYSIS_CACHE_TTL = 24 * 60 * 60 * 1000;
+const analysisCache = new Map(); // Key: blog content hash, Value: { result, timestamp }
+const ANALYSIS_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours
 
-// ── In-flight fetch dedup (fixes multi-user race condition) ──
-// Key: collectionId → Promise
-// When user A starts fetching, user B awaits the SAME promise
-const inflight = new Map();
-
-function hash(str) {
-  let h = 0;
-  for (let i = 0; i < Math.min(str.length, 5000); i++) {
-    h = ((h << 5) - h) + str.charCodeAt(i);
-    h = h & h;
+// Simple hash function for cache keys
+function hashString(str) {
+  let hash = 0;
+  for (let i = 0; i < str.length; i++) {
+    const char = str.charCodeAt(i);
+    hash = ((hash << 5) - hash) + char;
+    hash = hash & hash;
   }
-  return h.toString(36);
+  return hash.toString(36);
 }
 
-function cacheGet(map, key, ttl) {
-  const e = map.get(key);
-  if (!e || (Date.now() - e.ts) > ttl) return null;
-  return e.data;
+function isCacheValid(cache, key, ttl) {
+  const entry = cache.get(key);
+  if (!entry) return false;
+  return (Date.now() - entry.timestamp) < ttl;
 }
 
-function cacheSet(map, key, data) {
-  map.set(key, { data, ts: Date.now() });
+function getFromCache(cache, key, ttl) {
+  if (!isCacheValid(cache, key, ttl)) return null;
+  return cache.get(key).data;
 }
 
-// Periodic cleanup
+function setCache(cache, key, data) {
+  cache.set(key, { data, timestamp: Date.now() });
+}
+
+// Clean old cache entries periodically
 setInterval(() => {
   const now = Date.now();
-  for (const [k, v] of blogCache) if (now - v.ts > BLOG_CACHE_TTL) blogCache.delete(k);
-  for (const [k, v] of searchCache) if (now - v.ts > SEARCH_CACHE_TTL) searchCache.delete(k);
-  for (const [k, v] of analysisCache) if (now - v.ts > ANALYSIS_CACHE_TTL) analysisCache.delete(k);
-}, 5 * 60 * 1000);
+  for (const [key, value] of blogCache.entries()) {
+    if (now - value.timestamp > BLOG_CACHE_TTL) blogCache.delete(key);
+  }
+  for (const [key, value] of searchResultsCache.entries()) {
+    if (now - value.timestamp > SEARCH_CACHE_TTL) searchResultsCache.delete(key);
+  }
+  for (const [key, value] of analysisCache.entries()) {
+    if (now - value.timestamp > ANALYSIS_CACHE_TTL) analysisCache.delete(key);
+  }
+}, 5 * 60 * 1000); // Clean every 5 minutes
 
 // ════════════════════════════════════════════
 // RATE LIMITING
 // ════════════════════════════════════════════
-const rateMap = new Map();
-const RATE_WINDOW = 60_000;
-const RATE_MAX = 30;
+const rateLimitMap = new Map(); // Key: IP, Value: { count, resetTime }
+const RATE_LIMIT_WINDOW = 60 * 1000; // 1 minute
+const MAX_REQUESTS_PER_WINDOW = 30; // 30 requests per minute
 
-function rateOk(ip) {
+function checkRateLimit(ip) {
   const now = Date.now();
-  const r = rateMap.get(ip);
-  if (!r || now > r.reset) { rateMap.set(ip, { count: 1, reset: now + RATE_WINDOW }); return true; }
-  if (r.count >= RATE_MAX) return false;
-  r.count++;
+  const record = rateLimitMap.get(ip);
+  
+  if (!record || now > record.resetTime) {
+    rateLimitMap.set(ip, { count: 1, resetTime: now + RATE_LIMIT_WINDOW });
+    return true;
+  }
+  
+  if (record.count >= MAX_REQUESTS_PER_WINDOW) {
+    return false;
+  }
+  
+  record.count++;
   return true;
 }
 
+// Clean rate limit map periodically
 setInterval(() => {
   const now = Date.now();
-  for (const [k, v] of rateMap) if (now > v.reset) rateMap.delete(k);
-}, 2 * 60 * 1000);
+  for (const [ip, record] of rateLimitMap.entries()) {
+    if (now > record.resetTime) rateLimitMap.delete(ip);
+  }
+}, 2 * 60 * 1000); // Clean every 2 minutes
 
 // ════════════════════════════════════════════
-// FETCH WITH TIMEOUT + RETRY
+// FETCH WITH TIMEOUT & RETRY
 // ════════════════════════════════════════════
-async function fetchR(url, opts = {}, timeout = 30000, retries = 3) {
-  for (let i = 1; i <= retries; i++) {
+async function fetchWithTimeout(url, options = {}, timeoutMs = 30000, retries = 3) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
     try {
-      const ctrl = new AbortController();
-      const tid = setTimeout(() => ctrl.abort(), timeout);
-      const r = await fetch(url, { ...opts, signal: ctrl.signal });
-      clearTimeout(tid);
-      return r;
-    } catch (e) {
-      if (i === retries) throw e;
-      await new Promise(r => setTimeout(r, Math.min(1000 * 2 ** (i - 1), 5000)));
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+      
+      const response = await fetch(url, {
+        ...options,
+        signal: controller.signal
+      });
+      
+      clearTimeout(timeoutId);
+      return response;
+      
+    } catch (error) {
+      if (attempt === retries) throw error;
+      
+      // Exponential backoff
+      const delay = Math.min(1000 * Math.pow(2, attempt - 1), 5000);
+      console.log(`Retry ${attempt}/${retries} after ${delay}ms...`);
+      await new Promise(r => setTimeout(r, delay));
     }
   }
 }
 
-// ════════════════════════════════════════════
-// FETCH ALL BLOGS (with dedup for concurrent users)
-// ════════════════════════════════════════════
 async function fetchAllBlogs(collectionId, token) {
-  // Check cache first
-  const cached = cacheGet(blogCache, collectionId, BLOG_CACHE_TTL);
-  if (cached) return cached;
-
-  // If another request is already fetching this collection, wait for it
-  if (inflight.has(collectionId)) {
-    console.log(`  Waiting for in-flight fetch of ${collectionId}...`);
-    return inflight.get(collectionId);
-  }
-
-  // Start fetch and store the promise so others can await it
-  const fetchPromise = (async () => {
-    console.log('Fetching all blogs from Webflow...');
-    const items = [];
-    let offset = 0;
-
-    while (true) {
-      const r = await fetchR(
-        `https://api.webflow.com/v2/collections/${collectionId}/items?limit=100&offset=${offset}`,
-        { headers: { 'Authorization': `Bearer ${token}`, 'accept': 'application/json' } },
-        30000, 3
-      );
-      if (!r.ok) throw new Error(`Webflow ${r.status}: ${await r.text()}`);
-      const d = await r.json();
-      const batch = d.items || [];
-      items.push(...batch);
-      if (batch.length < 100) break;
-      offset += 100;
-      await new Promise(r => setTimeout(r, 300));
+  console.log('Fetching blogs from Webflow...');
+  const items = [];
+  let offset = 0;
+  
+  while (true) {
+    const url = `https://api.webflow.com/v2/collections/${collectionId}/items?limit=100&offset=${offset}`;
+    
+    const res = await fetchWithTimeout(url, {
+      headers: { 'Authorization': `Bearer ${token}`, 'accept': 'application/json' }
+    }, 30000, 3);
+    
+    if (!res.ok) {
+      const errorText = await res.text();
+      throw new Error(`Webflow ${res.status}: ${errorText}`);
     }
-
-    // Dedup
-    const seen = new Set();
-    const unique = items.filter(i => { if (seen.has(i.id)) return false; seen.add(i.id); return true; });
-    console.log(`Fetched ${unique.length} unique blogs`);
-
-    // Cache
-    cacheSet(blogCache, collectionId, unique);
-    return unique;
-  })();
-
-  inflight.set(collectionId, fetchPromise);
-
-  try {
-    const result = await fetchPromise;
-    return result;
-  } finally {
-    // Always clean up inflight, even on error
-    inflight.delete(collectionId);
+    
+    const data = await res.json();
+    const batch = data.items || [];
+    items.push(...batch);
+    
+    if (batch.length < 100) break;
+    offset += 100;
+    
+    // Rate limit: wait between requests
+    await new Promise(r => setTimeout(r, 300));
   }
+  
+  const seen = new Set();
+  return items.filter(i => { if (seen.has(i.id)) return false; seen.add(i.id); return true; });
 }
 
 // ════════════════════════════════════════════
-// WIDGET PROTECTION
+// WIDGET PROTECTION - Prevents Claude from stripping embeds
 // ════════════════════════════════════════════
 function protectWidgets(html) {
   const widgets = [];
-  const safe = html.replace(
+  const protectedHtml = html.replace(
     /(<(?:iframe|script|embed|object)[^>]*>(?:[\s\S]*?<\/(?:iframe|script|embed|object)>)?)|(<div[^>]*class="[^"]*(?:w-embed|w-widget|widget|embed)[^"]*"[^>]*>[\s\S]*?<\/div>)|(<figure[^>]*>[\s\S]*?<\/figure>)|(<video[^>]*>[\s\S]*?<\/video>)/gi,
-    (m) => { const id = `___WIDGET_${widgets.length}___`; widgets.push(m); return id; }
+    (match) => {
+      const id = `___WIDGET_${widgets.length}___`;
+      widgets.push(match);
+      return id;
+    }
   );
-  return { html: safe, widgets };
+  return { protectedHtml, widgets };
 }
 
 function restoreWidgets(html, widgets) {
-  let out = html;
-  widgets.forEach((w, i) => { out = out.replace(`___WIDGET_${i}___`, w); });
-  return out;
+  let restored = html;
+  widgets.forEach((widget, i) => {
+    restored = restored.replace(`___WIDGET_${i}___`, widget);
+  });
+  return restored;
 }
 
 // ════════════════════════════════════════════
-// GET /api/webflow
+// GET /api/webflow — blogs list OR single item
 // ════════════════════════════════════════════
 app.get('/api/webflow', async (req, res) => {
   try {
-    const ip = req.ip || req.connection?.remoteAddress;
-    if (!rateOk(ip)) return res.status(429).json({ error: 'Too many requests. Wait a minute.' });
-
+    const clientIp = req.ip || req.connection.remoteAddress;
+    
+    // Rate limiting
+    if (!checkRateLimit(clientIp)) {
+      return res.status(429).json({ 
+        error: 'Too many requests. Please wait a minute.' 
+      });
+    }
+    
     const { collectionId, itemId } = req.query;
     const token = req.headers.authorization?.replace('Bearer ', '');
-    if (!token || !collectionId) return res.status(400).json({ error: 'Missing credentials' });
+    
+    if (!token || !collectionId) {
+      return res.status(400).json({ error: 'Missing credentials' });
+    }
 
-    // Single item
+    // Single blog fetch
     if (itemId) {
-      const r = await fetchR(
+      const r = await fetchWithTimeout(
         `https://api.webflow.com/v2/collections/${collectionId}/items/${itemId}`,
         { headers: { 'Authorization': `Bearer ${token}`, 'accept': 'application/json' } },
-        15000, 2
+        15000,
+        2
       );
       const d = await r.json();
       return r.ok ? res.json(d) : res.status(r.status).json(d);
     }
 
-    // All blogs (with dedup)
-    const items = await fetchAllBlogs(collectionId, token);
-    const fromCache = !!cacheGet(blogCache, collectionId, BLOG_CACHE_TTL);
-
-    // Auto-detect siteId from collection info (needed for image uploads)
-    let siteId = null;
-    try {
-      const colRes = await fetchR(
-        `https://api.webflow.com/v2/collections/${collectionId}`,
-        { headers: { 'Authorization': `Bearer ${token}`, 'accept': 'application/json' } },
-        10000, 1
-      );
-      if (colRes.ok) {
-        const colData = await colRes.json();
-        siteId = colData.siteId || null;
-      }
-    } catch (e) {
-      console.warn('Could not fetch siteId:', e.message);
+    // Check cache first
+    const cacheKey = collectionId;
+    const cached = getFromCache(blogCache, cacheKey, BLOG_CACHE_TTL);
+    if (cached) {
+      console.log(`Serving ${cached.length} blogs from cache`);
+      return res.json({ items: cached, cached: true });
     }
 
-    res.json({ items, cached: fromCache, siteId });
-
+    // Fetch all blogs
+    const items = await fetchAllBlogs(collectionId, token);
+    setCache(blogCache, cacheKey, items);
+    
+    console.log(`Fetched and cached ${items.length} blogs`);
+    res.json({ items, cached: false });
+    
   } catch (err) {
-    console.error('Webflow fetch error:', err.message);
-    if (err.name === 'AbortError') return res.status(408).json({ error: 'Timeout. Try again.', type: 'timeout' });
+    console.error('Webflow fetch error:', err);
+    
+    if (err.name === 'AbortError') {
+      return res.status(408).json({ 
+        error: 'Request timeout. Please try again.',
+        type: 'timeout'
+      });
+    }
+    
     res.status(500).json({ error: err.message });
   }
 });
 
 // ════════════════════════════════════════════
-// PATCH /api/webflow
+// PATCH /api/webflow — publish to Webflow
 // ════════════════════════════════════════════
 app.patch('/api/webflow', async (req, res) => {
   try {
-    const ip = req.ip || req.connection?.remoteAddress;
-    if (!rateOk(ip)) return res.status(429).json({ error: 'Too many requests.' });
-
+    const clientIp = req.ip || req.connection.remoteAddress;
+    
+    if (!checkRateLimit(clientIp)) {
+      return res.status(429).json({ error: 'Too many requests. Please wait a minute.' });
+    }
+    
     const { collectionId, itemId } = req.query;
     const token = req.headers.authorization?.replace('Bearer ', '');
     const { fieldData } = req.body;
-    if (!token || !collectionId || !itemId || !fieldData) return res.status(400).json({ error: 'Missing fields' });
+    
+    if (!token || !collectionId || !itemId || !fieldData) {
+      return res.status(400).json({ error: 'Missing fields' });
+    }
 
-    const r = await fetchR(
-      `https://api.webflow.com/v2/collections/${collectionId}/items/${itemId}`,
-      { method: 'PATCH', headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json', 'accept': 'application/json' }, body: JSON.stringify({ fieldData }) },
-      60000, 3
-    );
-    const d = await r.json();
-    if (!r.ok) return res.status(r.status).json(d);
+    const url = `https://api.webflow.com/v2/collections/${collectionId}/items/${itemId}`;
+    const response = await fetchWithTimeout(url, {
+      method: 'PATCH',
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Content-Type': 'application/json',
+        'accept': 'application/json'
+      },
+      body: JSON.stringify({ fieldData })
+    }, 60000, 3); // 60 second timeout, 3 retries
+    
+    const data = await response.json();
+    if (!response.ok) return res.status(response.status).json(data);
 
-    // Invalidate cache
+    // Invalidate cache for this collection
     blogCache.delete(collectionId);
+    
     console.log('Published:', itemId);
-    res.json(d);
+    res.json(data);
+    
   } catch (err) {
-    console.error('Publish error:', err.message);
-    if (err.name === 'AbortError') return res.status(408).json({ error: 'Publish timeout.', type: 'timeout' });
+    console.error('Publish error:', err);
+    
+    if (err.name === 'AbortError') {
+      return res.status(408).json({ 
+        error: 'Publish timeout. Please try again.',
+        type: 'timeout'
+      });
+    }
+    
     res.status(500).json({ error: err.message });
   }
 });
 
-// ============================================
-// IMAGE UPLOAD TO WEBFLOW
-// Add this AFTER the app.patch('/api/webflow') block
-// and BEFORE the app.post('/api/analyze') block
-// ============================================
+// ════════════════════════════════════════════
+// POST /api/upload-image — Upload to Webflow Assets
+// ════════════════════════════════════════════
 app.post('/api/upload-image', async (req, res) => {
   try {
-    const { image, filename, siteId } = req.body;
-    const webflowToken = req.headers.authorization?.replace('Bearer ', '');
-
-    if (!webflowToken || !image || !filename || !siteId) {
-      return res.status(400).json({ error: 'Missing fields (need image, filename, siteId)' });
+    const clientIp = req.ip || req.connection.remoteAddress;
+    
+    if (!checkRateLimit(clientIp)) {
+      return res.status(429).json({ error: 'Too many uploads. Please wait a minute.' });
     }
-
-    // Parse base64 image
+    
+    const { image, filename, siteId } = req.body;
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    
+    if (!token || !image || !filename) {
+      return res.status(400).json({ error: 'Missing required fields' });
+    }
+    
+    if (!siteId) {
+      return res.status(400).json({ 
+        error: 'Site ID required. Please reload blogs to get site ID.' 
+      });
+    }
+    
+    // Convert base64 to buffer
     const matches = image.match(/^data:image\/(\w+);base64,(.+)$/);
-    if (!matches) return res.status(400).json({ error: 'Invalid image format' });
-
-    const [, ext, b64] = matches;
-    const buf = Buffer.from(b64, 'base64');
-    if (buf.length > 5 * 1024 * 1024) return res.status(400).json({ error: 'Max 5MB' });
-
-    // Build multipart form
+    if (!matches) {
+      return res.status(400).json({ error: 'Invalid image format' });
+    }
+    
+    const [, ext, base64Data] = matches;
+    const buffer = Buffer.from(base64Data, 'base64');
+    
+    // Validate size (5MB max)
+    if (buffer.length > 5 * 1024 * 1024) {
+      return res.status(400).json({ error: 'Image too large (max 5MB)' });
+    }
+    
+    // Create form data
     const FormData = (await import('form-data')).default;
     const form = new FormData();
-    form.append('file', buf, {
-      filename: filename.replace(/[^a-zA-Z0-9.-]/g, '_'),
+    
+    // Clean filename
+    const cleanFilename = filename.replace(/[^a-zA-Z0-9.-]/g, '_');
+    
+    form.append('file', buffer, {
+      filename: cleanFilename,
       contentType: `image/${ext}`
     });
-
-    console.log(`📤 Uploading ${filename} (${(buf.length / 1024).toFixed(0)}KB) to Webflow...`);
-
-    const response = await fetch(`https://api.webflow.com/v2/sites/${siteId}/assets`, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${webflowToken}`,
-        ...form.getHeaders()
+    
+    // Upload to Webflow Assets API
+    console.log(`Uploading ${cleanFilename} (${(buffer.length / 1024).toFixed(1)}KB) to site ${siteId}...`);
+    
+    const response = await fetchWithTimeout(
+      `https://api.webflow.com/v2/sites/${siteId}/assets`,
+      {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          ...form.getHeaders()
+        },
+        body: form
       },
-      body: form
-    });
-
+      45000, // 45 second timeout for uploads
+      2 // 2 retries
+    );
+    
     if (!response.ok) {
-      const errBody = await response.text();
-      console.error('Webflow upload error:', errBody);
+      const errorText = await response.text();
+      console.error('Webflow upload error:', errorText);
       throw new Error(`Upload failed: ${response.status}`);
     }
-
+    
     const data = await response.json();
-    console.log('✅ Image uploaded:', data.publicUrl || data.url);
-
-    res.json({ url: data.publicUrl || data.url, assetId: data.id });
-  } catch (error) {
-    console.error('Upload error:', error.message);
-    res.status(500).json({ error: error.message });
+    console.log('Upload successful:', data.publicUrl || data.url);
+    
+    res.json({ 
+      url: data.publicUrl || data.url,
+      assetId: data.id 
+    });
+    
+  } catch (err) {
+    console.error('Image upload error:', err);
+    
+    if (err.name === 'AbortError') {
+      return res.status(408).json({ 
+        error: 'Upload timeout. Image may be too large.',
+        type: 'timeout'
+      });
+    }
+    
+    res.status(500).json({ error: err.message });
   }
 });
+
 // ════════════════════════════════════════════
-// SEARCH (cached)
+// BRAVE SEARCH (with caching)
 // ════════════════════════════════════════════
 async function braveSearch(query, key, count = 5) {
   if (!key) return [];
-  const ck = `b:${hash(query)}`;
-  const c = cacheGet(searchCache, ck, SEARCH_CACHE_TTL);
-  if (c) return c;
+  
+  const cacheKey = `brave:${hashString(query + count)}`;
+  const cached = getFromCache(searchResultsCache, cacheKey, SEARCH_CACHE_TTL);
+  if (cached) {
+    console.log(`  Brave cache hit: "${query}"`);
+    return cached;
+  }
+  
   try {
-    const r = await fetchR(`https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(query)}&count=${count}`,
-      { headers: { 'X-Subscription-Token': key, 'Accept': 'application/json' } }, 10000, 2);
-    if (!r.ok) return [];
-    const d = await r.json();
-    const results = (d.web?.results || []).map(x => ({ title: x.title, url: x.url, snippet: x.description || '', source: 'brave' }));
-    cacheSet(searchCache, ck, results);
+    const url = `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(query)}&count=${count}`;
+    const res = await fetchWithTimeout(
+      url, 
+      { headers: { 'X-Subscription-Token': key, 'Accept': 'application/json' } },
+      10000,
+      2
+    );
+    
+    if (!res.ok) {
+      console.warn(`Brave search failed: ${res.status}`);
+      return [];
+    }
+    
+    const data = await res.json();
+    const results = (data.web?.results || []).map(r => ({ 
+      title: r.title, 
+      url: r.url, 
+      snippet: r.description || '', 
+      source: 'brave' 
+    }));
+    
+    setCache(searchResultsCache, cacheKey, results);
     return results;
-  } catch { return []; }
-}
-
-async function googleSearch(query, count = 5) {
-  if (!GOOGLE_API_KEY || !GOOGLE_CX) return [];
-  const ck = `g:${hash(query)}`;
-  const c = cacheGet(searchCache, ck, SEARCH_CACHE_TTL);
-  if (c) return c;
-  try {
-    const r = await fetchR(`https://www.googleapis.com/customsearch/v1?key=${GOOGLE_API_KEY}&cx=${GOOGLE_CX}&q=${encodeURIComponent(query)}&num=${count}`, {}, 10000, 2);
-    if (!r.ok) return [];
-    const d = await r.json();
-    const results = (d.items || []).map(x => ({ title: x.title, url: x.link, snippet: x.snippet || '', source: 'google' }));
-    cacheSet(searchCache, ck, results);
-    return results;
-  } catch { return []; }
+    
+  } catch (err) {
+    console.warn(`Brave search error: ${err.message}`);
+    return [];
+  }
 }
 
 // ════════════════════════════════════════════
-// POST /api/smartcheck
+// GOOGLE CUSTOM SEARCH (with caching)
+// ════════════════════════════════════════════
+async function googleSearch(query, key, cx, count = 5) {
+  if (!key || !cx) return [];
+  
+  const cacheKey = `google:${hashString(query + count)}`;
+  const cached = getFromCache(searchResultsCache, cacheKey, SEARCH_CACHE_TTL);
+  if (cached) {
+    console.log(`  Google cache hit: "${query}"`);
+    return cached;
+  }
+  
+  try {
+    const url = `https://www.googleapis.com/customsearch/v1?key=${key}&cx=${cx}&q=${encodeURIComponent(query)}&num=${count}`;
+    const res = await fetchWithTimeout(url, {}, 10000, 2);
+    
+    if (!res.ok) {
+      console.warn(`Google search failed: ${res.status}`);
+      return [];
+    }
+    
+    const data = await res.json();
+    const results = (data.items || []).map(r => ({ 
+      title: r.title, 
+      url: r.link, 
+      snippet: r.snippet || '', 
+      source: 'google' 
+    }));
+    
+    setCache(searchResultsCache, cacheKey, results);
+    return results;
+    
+  } catch (err) {
+    console.warn(`Google search error: ${err.message}`);
+    return [];
+  }
+}
+
+// ════════════════════════════════════════════
+// POST /api/smartcheck — Research + Rewrite (with caching)
 // ════════════════════════════════════════════
 app.post('/api/smartcheck', async (req, res) => {
   try {
-    const ip = req.ip || req.connection?.remoteAddress;
-    if (!rateOk(ip)) return res.status(429).json({ error: 'Too many requests.' });
+    const clientIp = req.ip || req.connection.remoteAddress;
+    
+    if (!checkRateLimit(clientIp)) {
+      return res.status(429).json({ error: 'Too many analysis requests. Please wait a minute.' });
+    }
+    
+    const {
+      blogContent, title, slug,
+      anthropicKey, braveKey, googleKey, googleCx,
+      gscKeywords
+    } = req.body;
 
-    const { blogContent, title, anthropicKey, braveKey, gscKeywords } = req.body;
-    if (!blogContent || !anthropicKey) return res.status(400).json({ error: 'Missing fields' });
+    if (!blogContent || !anthropicKey) {
+      return res.status(400).json({ error: 'Missing required fields' });
+    }
 
-    // Check analysis cache
-    const contentKey = hash(blogContent + JSON.stringify(gscKeywords || []));
-    const cachedResult = cacheGet(analysisCache, contentKey, ANALYSIS_CACHE_TTL);
-    if (cachedResult) {
+    // Check analysis cache (based on content hash + GSC keywords)
+    const contentHash = hashString(blogContent + JSON.stringify(gscKeywords || []));
+    const cachedAnalysis = getFromCache(analysisCache, contentHash, ANALYSIS_CACHE_TTL);
+    
+    if (cachedAnalysis) {
       console.log('Serving cached analysis');
-      return res.json({ ...cachedResult, fromCache: true });
+      return res.json({
+        ...cachedAnalysis,
+        fromCache: true
+      });
     }
 
     const anthropic = new Anthropic({ apiKey: anthropicKey });
     const t0 = Date.now();
     let searchCount = 0;
 
-    // ── Step 0: Widget protection ──
-    const { html: protectedContent, widgets } = protectWidgets(blogContent);
-    console.log(`Protected ${widgets.length} widgets`);
+    // ── STEP 0: Protect widgets/embeds ──
+    console.log('=== Stage 0: Widget Protection ===');
+    const { protectedHtml: protectedContent, widgets } = protectWidgets(blogContent);
+    console.log(`  Protected ${widgets.length} widgets/embeds from Claude`);
 
-    // ── Step 1: Generate queries ──
-    console.log('=== Queries ===');
+    // ── 1. Generate search queries (with timeout) ──
+    console.log('=== Stage 1: Query Gen ===');
+    
     const qRes = await Promise.race([
       anthropic.messages.create({
-        model: 'claude-sonnet-4-20250514', max_tokens: 2000,
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 2000,
         messages: [{ role: 'user', content: `Generate 6-8 search queries to fact-check: "${title}"
 
 BLOG EXCERPT:
@@ -384,64 +527,89 @@ ${protectedContent.substring(0, 4000)}
 
 Return ONLY a JSON array of strings. Focus on:
 - Official pricing pages (site:company.com pricing)
-- Product feature updates 2025/2026
+- Product feature updates (product 2025 features)
 - Stats and claims verification
-- Competitor info
-If SalesRobot mentioned, include "site:salesrobot.co features 2025".` }]
+- Competitor info mentioned
+Include year 2025/2026 for latest info.` }]
       }),
-      new Promise((_, rej) => setTimeout(() => rej(new Error('Query timeout')), 30000))
+      new Promise((_, reject) => 
+        setTimeout(() => reject(new Error('Query generation timeout')), 30000)
+      )
     ]);
 
     let queries = [];
     try {
-      queries = JSON.parse(qRes.content[0].text.replace(/```json\n?|```\n?/g, '').trim());
+      const raw = qRes.content[0].text.replace(/```json\n?|```\n?/g, '').trim();
+      queries = JSON.parse(raw);
     } catch {
       const m = qRes.content[0].text.match(/\[[\s\S]*?\]/);
       queries = m ? JSON.parse(m[0]) : [];
     }
-    console.log(`${queries.length} queries`);
+    console.log(`  ${queries.length} queries generated`);
 
-    // ── Step 2: Parallel search (batched) ──
-    console.log('=== Search ===');
+    // ── 2. Run searches (parallel with limits) ──
+    console.log('=== Stage 2: Search ===');
     let allResults = [];
-    const batch = 3;
-    for (let i = 0; i < Math.min(queries.length, 8); i += batch) {
-      const slice = queries.slice(i, i + batch);
-      const results = await Promise.all(slice.map(async q => {
-        const [b, g] = await Promise.all([braveSearch(q, braveKey, 3), googleSearch(q, 3)]);
-        searchCount++;
-        return { query: q, results: [...b, ...g] };
-      }));
-      allResults.push(...results);
-      if (i + batch < Math.min(queries.length, 8)) await new Promise(r => setTimeout(r, 500));
+
+    // Process searches in batches of 3 to avoid rate limits
+    const batchSize = 3;
+    for (let i = 0; i < queries.length && i < 8; i += batchSize) {
+      const batch = queries.slice(i, i + batchSize);
+      
+      const batchResults = await Promise.all(
+        batch.map(async q => {
+          const [b, g] = await Promise.all([
+            braveSearch(q, braveKey, 3),
+            googleSearch(q, googleKey, googleCx, 3)
+          ]);
+          searchCount++;
+          return { query: q, results: [...b, ...g] };
+        })
+      );
+      
+      allResults.push(...batchResults);
+      
+      // Wait between batches
+      if (i + batchSize < Math.min(queries.length, 8)) {
+        await new Promise(r => setTimeout(r, 500));
+      }
     }
 
-    // Dedup results
+    // Dedupe
     const seen = new Set();
     const unique = [];
-    for (const g of allResults) for (const r of g.results) {
-      if (!seen.has(r.url)) { seen.add(r.url); unique.push({ ...r, query: g.query }); }
+    for (const grp of allResults) {
+      for (const r of grp.results) {
+        if (!seen.has(r.url)) { seen.add(r.url); unique.push({ ...r, query: grp.query }); }
+      }
     }
-    console.log(`${unique.length} unique results from ${searchCount} searches`);
+    console.log(`  ${unique.length} unique results from ${searchCount} searches`);
 
-    // ── Step 3: Claude rewrite ──
-    console.log('=== Rewrite ===');
-    const research = unique.map(r => `[${r.source?.toUpperCase()}] ${r.title}\nURL: ${r.url}\n${r.snippet}`).join('\n\n');
+    // ── 3. Claude rewrite (with timeout) ──
+    console.log('=== Stage 3: Rewrite ===');
+
+    const research = unique.map(r =>
+      `[${r.source?.toUpperCase()}] ${r.title}\nURL: ${r.url}\n${r.snippet}`
+    ).join('\n\n');
 
     let gscBlock = '';
     if (gscKeywords?.length > 0) {
-      gscBlock = `\n\nGSC KEYWORDS TO INTEGRATE:\n${gscKeywords.map(k => `- "${k.keyword}" (Pos ${k.position}, ${k.clicks} clicks)`).join('\n')}
+      gscBlock = `
+
+GSC KEYWORDS TO INTEGRATE:
+${gscKeywords.map(k => `- "${k.keyword}" (Pos ${k.position}, ${k.clicks} clicks)`).join('\n')}
 
 GSC RULES:
-- Work keywords into EXISTING H2/H3 headings where natural
+- Work keywords into EXISTING H2/H3 headings where natural — change heading text to include the keyword
 - Add a short paragraph for keywords with no existing coverage
-- For question keywords (who/what/how/why/is/can/does), add FAQ at bottom: <h2>Frequently Asked Questions</h2> with <h3>question</h3><p>answer</p> pairs
-- Do NOT keyword-stuff`;
+- For question keywords (who/what/how/why/is/can/does), add an FAQ at bottom: <h2>Frequently Asked Questions</h2> with <h3>question</h3><p>answer</p> pairs
+- Do NOT keyword-stuff — text must read naturally`;
     }
 
     const rwRes = await Promise.race([
       anthropic.messages.create({
-        model: 'claude-sonnet-4-20250514', max_tokens: 16000,
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 16000,
         messages: [{ role: 'user', content: `You are an expert blog content updater. Rewrite this blog using the research below.
 
 TITLE: ${title}
@@ -453,66 +621,88 @@ RESEARCH:
 ${research}
 ${gscBlock}
 
-ABSOLUTE RULES:
-1. Return ONLY updated HTML. No markdown fences. No explanation before or after.
-2. PRESERVE every HTML tag, class, id, data-*, style attribute EXACTLY.
+ABSOLUTE RULES — violating any is a failure:
+1. Return ONLY the updated HTML. No markdown fences. No explanation.
+2. PRESERVE every HTML tag, class, id, data attribute EXACTLY as-is unless fixing a fact.
 3. PRESERVE all heading levels (h1-h6). Only change heading TEXT for GSC keywords or factual fixes.
-4. PRESERVE every <ul>, <ol>, <li> with ALL attributes (role, class, style).
-5. PRESERVE every <strong>, <em>, <b>, <i> tag — NEVER strip bold/italic.
-6. PRESERVE every <a> with href, target, rel.
-7. PRESERVE every <img> with src, alt, loading, width, height, class.
-8. PRESERVE every ___WIDGET_N___ placeholder EXACTLY as-is.
-9. Fix outdated facts (pricing, features, stats) using research.
-10. New lists: <ul role="list"><li role="listitem">text</li></ul>
+4. PRESERVE every <ul>, <ol>, <li> with ALL attributes (role, class, style, etc).
+5. PRESERVE every <strong>, <em>, <b>, <i> tag.
+6. PRESERVE every <a> with href, target, rel attributes.
+7. PRESERVE every <img> with src, alt, loading, width, height, class, style attributes.
+8. PRESERVE every placeholder like ___WIDGET_0___, ___WIDGET_1___ etc. These are special markers that must remain unchanged.
+9. Fix outdated facts (pricing, features, stats) using research data.
+10. New lists MUST use: <ul role="list"><li role="listitem">text</li></ul>
 11. New bold = <strong>, new italic = <em>. Never markdown.
-12. Active voice. Remove em-dashes. Use contractions.
-13. NEVER strip attributes from existing elements.
-14. NEVER remove or modify ___WIDGET_N___ markers.` }]
+12. Use active voice. Remove em-dashes. Use contractions where natural.
+13. NEVER strip attributes from any existing element.
+14. NEVER convert HTML to markdown.
+15. DO NOT remove or modify any ___WIDGET_N___ markers - these are essential placeholders.` }]
       }),
-      new Promise((_, rej) => setTimeout(() => rej(new Error('Rewrite timeout')), 120000))
+      new Promise((_, reject) => 
+        setTimeout(() => reject(new Error('Content rewrite timeout')), 120000)
+      )
     ]);
 
     let updated = rwRes.content[0].text;
     if (updated.startsWith('```')) updated = updated.replace(/^```(?:html)?\n?/, '').replace(/\n?```$/, '');
     updated = updated.trim();
 
-    // ── Step 4: Restore widgets ──
+    // ── STEP 4: Restore widgets ──
+    console.log('=== Stage 4: Widget Restoration ===');
     updated = restoreWidgets(updated, widgets);
-    console.log(`Restored ${widgets.length} widgets`);
+    console.log(`  Restored ${widgets.length} widgets/embeds to final HTML`);
 
     const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
     console.log(`Done in ${elapsed}s`);
 
     const result = {
       updatedContent: updated,
-      stats: { searches: searchCount, results: unique.length, elapsed, gscKeywords: gscKeywords?.length || 0, widgetsProtected: widgets.length },
+      stats: { 
+        searches: searchCount, 
+        results: unique.length, 
+        elapsed, 
+        gscKeywords: gscKeywords?.length || 0,
+        widgetsProtected: widgets.length 
+      },
       research: unique.slice(0, 15)
     };
 
-    cacheSet(analysisCache, contentKey, result);
-    res.json(result);
+    // Cache the result
+    setCache(analysisCache, contentHash, result);
 
+    res.json(result);
+    
   } catch (err) {
-    console.error('SmartCheck error:', err.message);
-    if (err.message.includes('timeout')) return res.status(408).json({ error: 'Analysis timeout. Try a shorter post.', type: 'timeout' });
+    console.error('Smart check error:', err);
+    
+    if (err.message.includes('timeout')) {
+      return res.status(408).json({ 
+        error: 'Analysis timeout. Please try again with a shorter blog post.',
+        type: 'timeout'
+      });
+    }
+    
     res.status(500).json({ error: err.message });
   }
 });
 
 // ════════════════════════════════════════════
-// HEALTH
+// HEALTH & STATS
 // ════════════════════════════════════════════
 app.get('/api/health', (req, res) => {
   res.json({
     status: 'ok',
     uptime: process.uptime(),
-    caches: { blogs: blogCache.size, search: searchCache.size, analysis: analysisCache.size },
-    inflight: inflight.size,
-    google: GOOGLE_API_KEY ? 'ON' : 'OFF'
+    memory: process.memoryUsage(),
+    caches: {
+      blogs: blogCache.size,
+      searchResults: searchResultsCache.size,
+      analyses: analysisCache.size
+    },
+    rateLimits: {
+      activeIPs: rateLimitMap.size
+    }
   });
 });
 
-app.listen(PORT, () => {
-  console.log(`ContentOps backend: port ${PORT}`);
-  console.log(`Google: ${GOOGLE_API_KEY ? 'ON' : 'OFF'} | Brave: client-key | Cache: ON`);
-});
+app.listen(PORT, () => console.log(`Server on port ${PORT}`));
