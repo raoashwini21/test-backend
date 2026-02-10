@@ -235,41 +235,131 @@ app.post('/api/upload-image', upload.single('file'), async (req, res) => {
     });
 
     if (!token) return res.status(400).json({ error: 'Missing authorization token' });
-    if (!file) return res.status(400).json({ error: 'No file uploaded. Send as multipart/form-data with a "file" field.' });
+    if (!file) return res.status(400).json({ error: 'No file uploaded.' });
     if (!siteId) return res.status(400).json({ error: 'Site ID required. Reload blogs to get site ID.' });
     if (!file.mimetype.startsWith('image/')) return res.status(400).json({ error: 'File must be an image' });
 
-    // Build form-data for Webflow API
-    const FormData = (await import('form-data')).default;
-    const form = new FormData();
     const cleanFilename = (file.originalname || 'image.png').replace(/[^a-zA-Z0-9.-]/g, '_');
 
+    // ── Step 1: Request an upload URL from Webflow ──
+    console.log(`Step 1: Requesting upload URL for ${cleanFilename} (${(file.size / 1024).toFixed(1)}KB)...`);
+
+    const step1Res = await fetchWithTimeout(
+      `https://api.webflow.com/v2/sites/${siteId}/assets`,
+      {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Content-Type': 'application/json',
+          'accept': 'application/json'
+        },
+        body: JSON.stringify({
+          fileName: cleanFilename,
+          fileHash: hashString(file.buffer.toString('base64').substring(0, 1000) + file.size)
+        })
+      },
+      30000, 2
+    );
+
+    if (!step1Res.ok) {
+      const errText = await step1Res.text();
+      console.error('Step 1 failed:', step1Res.status, errText);
+      throw new Error(`Webflow asset request failed: ${step1Res.status} — ${errText}`);
+    }
+
+    const uploadMeta = await step1Res.json();
+    console.log('Step 1 response:', JSON.stringify(uploadMeta).substring(0, 500));
+
+    // Webflow returns uploadUrl + uploadDetails (S3 form fields)
+    const uploadUrl = uploadMeta.uploadUrl;
+    const uploadDetails = uploadMeta.uploadDetails;
+    const assetId = uploadMeta.id || uploadMeta._id;
+
+    if (!uploadUrl) {
+      // Some Webflow API versions return the asset directly (already uploaded via hash match)
+      if (uploadMeta.url || uploadMeta.publicUrl) {
+        console.log('Asset already exists (hash match), returning URL');
+        return res.json({
+          url: uploadMeta.publicUrl || uploadMeta.url,
+          assetId: assetId
+        });
+      }
+      throw new Error('No uploadUrl returned from Webflow');
+    }
+
+    // ── Step 2: Upload file to S3 using the presigned URL + form fields ──
+    console.log(`Step 2: Uploading to ${uploadUrl.substring(0, 80)}...`);
+
+    const FormData = (await import('form-data')).default;
+    const form = new FormData();
+
+    // Add all the S3 presigned form fields Webflow gave us
+    if (uploadDetails && typeof uploadDetails === 'object') {
+      for (const [key, value] of Object.entries(uploadDetails)) {
+        if (value !== null && value !== undefined) {
+          form.append(key, String(value));
+        }
+      }
+    }
+
+    // The file MUST be the last field in the form
     form.append('file', file.buffer, {
       filename: cleanFilename,
       contentType: file.mimetype
     });
 
-    console.log(`Uploading ${cleanFilename} (${(file.size / 1024).toFixed(1)}KB) to site ${siteId}...`);
-
-    const response = await fetchWithTimeout(
-      `https://api.webflow.com/v2/sites/${siteId}/assets`,
+    const step2Res = await fetchWithTimeout(
+      uploadUrl,
       {
         method: 'POST',
-        headers: { 'Authorization': `Bearer ${token}`, ...form.getHeaders() },
+        headers: form.getHeaders(),
         body: form
       },
       45000, 2
     );
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.error('Webflow upload error:', response.status, errorText);
-      throw new Error(`Upload failed: ${response.status} — ${errorText}`);
+    // S3 returns 200-204 on success
+    if (step2Res.status >= 200 && step2Res.status < 300) {
+      console.log('Step 2 upload successful, status:', step2Res.status);
+    } else {
+      const errText = await step2Res.text();
+      console.error('Step 2 failed:', step2Res.status, errText.substring(0, 300));
+      throw new Error(`S3 upload failed: ${step2Res.status}`);
     }
 
-    const data = await response.json();
-    console.log('Upload successful:', data.publicUrl || data.url);
-    res.json({ url: data.publicUrl || data.url, assetId: data.id });
+    // Build the final asset URL
+    // Webflow asset URLs follow the pattern: assets.website-files.com/...
+    const finalUrl = uploadMeta.hostedUrl || uploadMeta.publicUrl || uploadMeta.url ||
+      (uploadMeta.original ? uploadMeta.original : null);
+
+    if (finalUrl) {
+      console.log('Upload complete:', finalUrl);
+      return res.json({ url: finalUrl, assetId });
+    }
+
+    // If we don't have a URL yet, fetch the asset to get it
+    console.log('Fetching asset details for ID:', assetId);
+    await new Promise(r => setTimeout(r, 1500)); // Brief wait for Webflow to process
+
+    const assetRes = await fetchWithTimeout(
+      `https://api.webflow.com/v2/sites/${siteId}/assets/${assetId}`,
+      {
+        headers: { 'Authorization': `Bearer ${token}`, 'accept': 'application/json' }
+      },
+      15000, 2
+    );
+
+    if (assetRes.ok) {
+      const assetData = await assetRes.json();
+      const url = assetData.hostedUrl || assetData.publicUrl || assetData.url || assetData.original;
+      console.log('Asset URL from API:', url);
+      return res.json({ url, assetId });
+    }
+
+    // Last resort: construct URL from known pattern
+    console.warn('Could not fetch asset URL, returning asset ID');
+    res.json({ url: null, assetId, note: 'Upload succeeded but URL could not be retrieved. Check Webflow Assets.' });
+
   } catch (err) {
     console.error('Image upload error:', err);
     if (err.name === 'AbortError') return res.status(408).json({ error: 'Upload timeout.', type: 'timeout' });
