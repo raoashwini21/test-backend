@@ -420,16 +420,17 @@ ${brandHints.join('\n')}
 READ THE ENTIRE BLOG FIRST to understand which product is being discussed. Only use research results that match the correct brand/product. Discard any search results about the wrong product.`;
     }
 
-    // TL;DR instruction
-    let tldrBlock = '';
+    // TL;DR instruction — injected at TOP of prompt and as a rule
+    let tldrTopInstruction = '';
+    let tldrRule = '';
     if (addTldr) {
-      tldrBlock = `
+      tldrTopInstruction = `
+CRITICAL FIRST TASK: This blog has NO TL;DR summary. You MUST add one at the very beginning of your output (before any other content). Use this exact format:
+<div class="tldr-box"><p><strong>TL;DR:</strong> [2-3 sentence summary of key takeaways. Be specific and actionable.]</p></div>
 
-TL;DR INSTRUCTION:
-The blog currently has NO TL;DR summary. You MUST add a short TL;DR section at the very beginning of the blog (right after the first <h1> or at the very top if no <h1>).
-Format it exactly like this:
-<div class="tldr-box"><p><strong>TL;DR:</strong> [2-3 sentence summary of the key takeaways from this blog post. Be specific and actionable, not generic.]</p></div>
-The TL;DR should capture the main point, key recommendation, or verdict of the article.`;
+`;
+      tldrRule = `
+16. ADD a TL;DR box at the VERY TOP of the output using: <div class="tldr-box"><p><strong>TL;DR:</strong> [summary]</p></div>`;
     }
 
     const rwRes = await Promise.race([
@@ -437,7 +438,7 @@ The TL;DR should capture the main point, key recommendation, or verdict of the a
         model: 'claude-sonnet-4-20250514',
         max_tokens: 16000,
         messages: [{ role: 'user', content: `You are an expert blog content updater. Rewrite this blog using the research below.
-
+${tldrTopInstruction}
 TITLE: ${title}
 
 CURRENT HTML:
@@ -445,7 +446,7 @@ ${protectedContent}
 
 RESEARCH:
 ${research}
-${gscBlock}${brandBlock}${tldrBlock}
+${gscBlock}${brandBlock}
 
 ABSOLUTE RULES — violating any is a failure:
 1. Return ONLY the updated HTML. No markdown fences. No explanation.
@@ -462,7 +463,7 @@ ABSOLUTE RULES — violating any is a failure:
 12. Use active voice. Remove em-dashes. Use contractions where natural.
 13. NEVER strip attributes from any existing element.
 14. NEVER convert HTML to markdown.
-15. DO NOT remove or modify any ___WIDGET_N___ markers.` }]
+15. DO NOT remove or modify any ___WIDGET_N___ markers.${tldrRule}` }]
       }),
       new Promise((_, reject) => setTimeout(() => reject(new Error('Content rewrite timeout')), 300000))
     ]);
